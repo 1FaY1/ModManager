@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTableWidget,
     QTableWidgetItem, QFileDialog, QMessageBox,
-    QLabel, QProgressBar, QHeaderView, QDialog
+    QLabel, QProgressBar, QHeaderView, QDialog, QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon # Добавили QIcon
@@ -22,8 +22,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# --- Настройки ---
-VERSION = "1.1"
+VERSION = "1.2"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
@@ -72,34 +71,87 @@ class ModSearchWorker(QThread):
 
     def __init__(self, query, loader, mc_ver):
         super().__init__()
-        self.query, self.loader, self.mc_ver = query.lower(), loader, mc_ver
+        self.query, self.loader, self.mc_ver = query.strip(), loader, mc_ver
 
     def run(self):
         try:
-            facets = ['["project_type:mod"]', f'["categories:{self.loader.lower()}"]', f'["versions:{self.mc_ver}"]']
-            params = {"query": self.query, "limit": 20, "facets": f"[{','.join(facets)}]"}
+            clean_loader = self.loader.strip().lower()
+            clean_ver = self.mc_ver.strip()
+
+            facets = [
+                '["project_type:mod"]',
+                f'["categories:{clean_loader}"]',
+                f'["versions:{clean_ver}"]'
+            ]
+
+            params = {
+                "query": self.query,
+                "limit": 25,
+                "index": "relevance",
+                "facets": f"[{','.join(facets)}]"
+            }
+
             r = requests.get(f"{MODRINTH_API}/search", params=params, headers=HEADERS, timeout=10)
+            r.raise_for_status()
             hits = r.json().get("hits", [])
+
+            def sorting_key(hit):
+                title = hit['title'].strip().lower()
+                query = self.query.strip().lower()
+
+                if title == query:
+                    return 0
+                if title.startswith(query):
+                    return 1
+                return 2
+
+            hits.sort(key=sorting_key)
+
+            hits = hits[:15]
             results = []
 
+
             def fetch_ver(hit):
-                v_p = {"loaders": f'["{self.loader.lower()}"]', "game_versions": f'["{self.mc_ver}"]'}
-                vr = requests.get(f"{MODRINTH_API}/project/{hit['project_id']}/version", params=v_p, headers=HEADERS,
-                                  timeout=5)
-                if vr.status_code == 200 and vr.json():
-                    v = vr.json()[0]
-                    return {"title": hit["title"], "author": hit["author"], "version": v["version_number"],
-                            "url": v["files"][0]["url"], "filename": v["files"][0]["filename"], "status": "Доступен",
-                            "needs_update": False}
+                v_params = {
+                    "loaders": f'["{clean_loader}"]',
+                    "game_versions": f'["{clean_ver}"]'
+                }
+
+                try:
+                    vr = requests.get(
+                        f"{MODRINTH_API}/project/{hit['project_id']}/version",
+                        params=v_params,
+                        headers=HEADERS,
+                        timeout=5
+                    )
+                    if vr.status_code == 200:
+                        versions = vr.json()
+                        if versions:
+                            v = versions[0]
+                            return {
+                                "title": hit["title"],
+                                "author": hit["author"],
+                                "version": v["version_number"],
+                                "url": v["files"][0]["url"],
+                                "filename": v["files"][0]["filename"],
+                                "status": "Доступен",
+                                "needs_update": False
+                            }
+                except:
+                    pass
                 return None
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
                 futures = [ex.submit(fetch_ver, h) for h in hits]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
-                    if res: results.append(res)
+                    if res:
+                        results.append(res)
+
             self.results_ready.emit(results, True)
-        except:
+
+        except Exception as e:
+            print(f"Search error: {e}")
             self.results_ready.emit([], False)
 
 
@@ -109,42 +161,72 @@ class FolderScannerWorker(QThread):
 
     def __init__(self, folder, loader, mc_ver, check_updates=False):
         super().__init__()
-        self.folder, self.loader, self.mc_ver, self.check_updates = folder, loader.lower(), mc_ver, check_updates
+        self.folder = folder
+        self.loader = loader.lower()
+        self.mc_ver = mc_ver
+        self.check_updates = check_updates
 
     def run(self):
         if not os.path.exists(self.folder):
-            self.finished.emit();
+            self.finished.emit()
             return
+
         files = [f for f in os.listdir(self.folder) if f.endswith('.jar')]
-        hash_to_file = {get_file_hash(os.path.join(self.folder, f)): f for f in files if
-                        get_file_hash(os.path.join(self.folder, f))}
+        hash_to_file = {}
+        for f in files:
+            path = os.path.join(self.folder, f)
+            h = get_file_hash(path)
+            if h:
+                hash_to_file[h] = f
+
+        if not hash_to_file:
+            self.finished.emit()
+            return
 
         recognized = {}
-        if hash_to_file:
-            try:
-                r = requests.post(f"{MODRINTH_API}/version_files",
-                                  json={"hashes": list(hash_to_file.keys()), "algorithm": "sha1"}, headers=HEADERS,
-                                  timeout=10)
-                if r.status_code == 200: recognized = r.json()
-            except:
-                pass
+        try:
+            r = requests.post(
+                f"{MODRINTH_API}/version_files",
+                json={"hashes": list(hash_to_file.keys()), "algorithm": "sha1"},
+                headers=HEADERS,
+                timeout=15
+            )
+            if r.status_code == 200:
+                recognized = r.json()
+        except:
+            pass
 
         project_names = {}
         u_ids = list(set(v['project_id'] for v in recognized.values()))
         if u_ids:
             try:
-                rp = requests.get(f"{MODRINTH_API}/projects", params={"ids": json.dumps(u_ids)}, headers=HEADERS,
-                                  timeout=5)
-                if rp.status_code == 200: project_names = {p['id']: p['title'] for p in rp.json()}
+                rp = requests.get(
+                    f"{MODRINTH_API}/projects",
+                    params={"ids": json.dumps(u_ids)},
+                    headers=HEADERS,
+                    timeout=15
+                )
+                if rp.status_code == 200:
+                    project_names = {p['id']: p['title'] for p in rp.json()}
             except:
                 pass
 
-        for f_hash, filename in hash_to_file.items():
-            result = {"title": filename, "author": "-", "version": "-", "status": "Не опознан", "url": None,
-                      "filename": filename, "needs_update": False}
+        def process_one_mod(item):
+            f_hash, filename = item
+            result = {
+                "title": filename,
+                "author": "-",
+                "version": "-",
+                "status": "Не опознан",
+                "url": None,
+                "filename": filename,
+                "needs_update": False
+            }
+
             if f_hash in recognized:
                 v_data = recognized[f_hash]
                 p_id = v_data['project_id']
+
                 result["title"] = project_names.get(p_id, filename)
                 result["author"] = "Modrinth"
                 result["version"] = v_data['version_number']
@@ -153,8 +235,12 @@ class FolderScannerWorker(QThread):
                 if self.check_updates:
                     try:
                         v_p = {"loaders": f'["{self.loader}"]', "game_versions": f'["{self.mc_ver}"]'}
-                        vr = requests.get(f"{MODRINTH_API}/project/{p_id}/version", params=v_p, headers=HEADERS,
-                                          timeout=5)
+                        vr = requests.get(
+                            f"{MODRINTH_API}/project/{p_id}/version",
+                            params=v_p,
+                            headers=HEADERS,
+                            timeout=10
+                        )
                         if vr.status_code == 200 and vr.json():
                             latest = vr.json()[0]
                             if latest['id'] != v_data['id']:
@@ -167,7 +253,21 @@ class FolderScannerWorker(QThread):
                                 result["status"] = "Актуально"
                     except:
                         pass
-            self.mod_found.emit(result)
+
+            return result
+
+        # WORKER_THREADS у тебя в начале файла = 8, значит 8 проверок одновременно
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
+            # Раздаем задачи
+            futures = [executor.submit(process_one_mod, item) for item in hash_to_file.items()]
+
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    res = future.result()
+                    self.mod_found.emit(res)
+                except Exception:
+                    pass
+
         self.finished.emit()
 
 
@@ -263,7 +363,11 @@ class ModManagerApp(QWidget):
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["Мод / Файл", "Источник", "Версия", "Статус", "Прогресс", "Действие"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
         layout.addWidget(self.table)
+
 
         bottom = QHBoxLayout()
         self.menu_btn = QPushButton("⋮");
@@ -336,16 +440,39 @@ class ModManagerApp(QWidget):
             with open(CONFIG_FILE, 'w') as conf: json.dump({"download_folder": f}, conf)
 
     def _load_api_data(self):
+        """Загружаем версии игры и загрузчики с обработкой ошибок."""
+        self.status_lbl.setText("Подключение к Modrinth...")
+        QApplication.processEvents()  # Чтобы интерфейс не завис на секунду
+
         try:
-            v_res = requests.get(f"{MODRINTH_API}/tag/game_version", timeout=5)
+            v_res = requests.get(f"{MODRINTH_API}/tag/game_version", timeout=10)
+            v_res.raise_for_status()  # Если сервер ответит ошибкой (404, 500), мы это поймаем
+
             if v_res.status_code == 200:
-                self.version_box.addItems([v['version'] for v in v_res.json() if v.get('version_type') == 'release'])
-            l_res = requests.get(f"{MODRINTH_API}/tag/loader", timeout=5)
+                versions = [v['version'] for v in v_res.json() if v.get('version_type') == 'release']
+                self.version_box.clear()  # Очищаем перед добавлением
+                self.version_box.addItems(versions)
+
+            l_res = requests.get(f"{MODRINTH_API}/tag/loader", timeout=10)
+            l_res.raise_for_status()
+
             if l_res.status_code == 200:
-                self.loader_box.addItems(sorted(
-                    [l['name'].capitalize() for l in l_res.json() if "mod" in l.get("supported_project_types", [])]))
-        except:
-            pass
+                loaders = sorted([l['name'].capitalize() for l in l_res.json()
+                                  if "mod" in l.get("supported_project_types", [])])
+                self.loader_box.clear()
+                self.loader_box.addItems(loaders)
+
+            self.status_lbl.setText("Данные API загружены")
+
+        except requests.exceptions.RequestException as e:
+            self.status_lbl.setText("Ошибка сети")
+            QMessageBox.critical(self, "Ошибка подключения",
+                                 f"Не удалось связаться с сервером Modrinth.\n"
+                                 f"Проверьте интернет и перезапустите программу.\n\n"
+                                 f"Детали: {str(e)}")
+        except Exception as e:
+            self.status_lbl.setText("Ошибка данных")
+            QMessageBox.warning(self, "Ошибка", f"Сбой при обработке данных:\n{str(e)}")
 
     def start_search(self):
         q = self.search_input.text().strip()
@@ -364,48 +491,74 @@ class ModManagerApp(QWidget):
         self.worker.start()
 
     def add_mod_to_table(self, res):
-        row = self.table.rowCount();
+        row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(res["title"]))
-        self.table.setItem(row, 1, QTableWidgetItem(res["author"]))
-        self.table.setItem(row, 2, QTableWidgetItem(res["version"]))
+
+        name_item = QTableWidgetItem(res["title"])
+        name_item.setToolTip(res["title"])  # Показывает полное имя при наведении
+        self.table.setItem(row, 0, name_item)
+
+        auth_item = QTableWidgetItem(res["author"])
+        auth_item.setToolTip(res["author"])
+        self.table.setItem(row, 1, auth_item)
+
+        ver_item = QTableWidgetItem(res["version"])
+        ver_item.setToolTip(res["version"])
+        self.table.setItem(row, 2, ver_item)
+
         st_item = QTableWidgetItem(res["status"])
+        st_item.setToolTip(res["status"])
+
         if res.get("needs_update"):
-            st_item.setForeground(QColor("#e67e22"));
+            st_item.setForeground(QColor("#e67e22"))
             self.update_all_btn.show()
-        elif "Актуально" in res["status"]:
+        elif "Актуально" in res["status"] or "Загружен" in res["status"]:
             st_item.setForeground(QColor("#27ae60"))
+
         self.table.setItem(row, 3, st_item)
-        pbar = QProgressBar();
-        pbar.setFixedHeight(12);
-        pbar.setTextVisible(False);
+
+        pbar = QProgressBar()
+        pbar.setFixedHeight(12)
+        pbar.setTextVisible(False)
         self.table.setCellWidget(row, 4, pbar)
+
         if res.get("url"):
-            btn = QPushButton("Обновить" if res.get("needs_update") else "Скачать")
+            btn_text = "Обновить" if res.get("needs_update") else "Скачать"
+            btn = QPushButton(btn_text)
             btn.clicked.connect(partial(self.download, row, res["url"], res["filename"]))
             self.table.setCellWidget(row, 5, btn)
 
     def update_all_mods(self):
+        """Проходит по всей таблице и нажимает кнопку 'Обновить' там, где она есть."""
         for r in range(self.table.rowCount()):
             btn = self.table.cellWidget(r, 5)
-            if isinstance(btn, QPushButton) and btn.text() == "Обновить": btn.click()
+            if isinstance(btn, QPushButton) and btn.text() == "Обновить":
+                btn.click()
 
     def download(self, row, url, filename):
+        """Метод для скачивания мода."""
         save_dir = self.download_folder if self.download_folder else self.mods_folder
         if not save_dir:
             QMessageBox.warning(self, "!", "Выберите папку для сохранения!");
             return
-        dest = os.path.join(save_dir, filename);
-        pbar = self.table.cellWidget(row, 4);
+
+        dest = os.path.join(save_dir, filename)
+        pbar = self.table.cellWidget(row, 4)
         btn = self.table.cellWidget(row, 5)
-        btn.setEnabled(False);
+
+        btn.setEnabled(False)
         downloader = DownloadThread(url, dest)
-        downloader.progress.connect(pbar.setValue);
-        downloader.finished.connect(lambda: btn.setText("Ок"))
-        downloader.start();
-        self.active_downloads.append(downloader)
+        downloader.progress.connect(pbar.setValue)
 
+        def on_done(path):
+            btn.setText("Ок")
+            self.status_lbl.setText(f"Скачано: {filename}")
 
+        downloader.finished.connect(on_done)
+        downloader.error.connect(lambda e: QMessageBox.critical(self, "Ошибка", e))
+
+        self.active_downloads.append(downloader)  # Чтобы поток не удалился из памяти
+        downloader.start()
 if __name__ == "__main__":
     app = QApplication(sys.argv);
     w = ModManagerApp();
