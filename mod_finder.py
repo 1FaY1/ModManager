@@ -85,11 +85,12 @@ class ModSearchWorker(QThread):
             ]
 
             params = {
-                "query": self.query,
+                "query": f'"{self.query}"',
                 "limit": 25,
                 "index": "relevance",
                 "facets": f"[{','.join(facets)}]"
             }
+
 
             r = requests.get(f"{MODRINTH_API}/search", params=params, headers=HEADERS, timeout=10)
             r.raise_for_status()
@@ -126,23 +127,19 @@ class ModSearchWorker(QThread):
                     if vr.status_code == 200:
                         versions = vr.json()
                         if versions:
-                            # ПУНКТ 3: ЛОГИКА ПРИОРИТЕТОВ (Release -> Beta -> Alpha)
                             selected_v = None
 
-                            # 1. Пробуем найти релиз
                             for v in versions:
                                 if v.get("version_type") == "release":
                                     selected_v = v
                                     break
 
-                            # 2. Если релиза нет, ищем бету
                             if not selected_v:
                                 for v in versions:
                                     if v.get("version_type") == "beta":
                                         selected_v = v
                                         break
 
-                            # 3. Если и беты нет, берем что угодно (обычно это альфа)
                             if not selected_v:
                                 selected_v = versions[0]
 
@@ -271,7 +268,6 @@ class FolderScannerWorker(QThread):
             return result
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
-            # Раздаем задачи
             futures = [executor.submit(process_one_mod, item) for item in hash_to_file.items()]
 
             for future in concurrent.futures.as_completed(futures):
@@ -289,16 +285,15 @@ class FolderSelectDialog(QDialog):
 
     def __init__(self, title="Выбор папки", parent=None):
         super().__init__(parent)
-        self.setWindowTitle(title);
-        self.setFixedSize(350, 200);
+        self.setWindowTitle(title)
+        self.setFixedSize(350, 200)
         self.setAcceptDrops(True)
         layout = QVBoxLayout()
-        # text= убирает предупреждение PyCharm
         self.lbl = QLabel(text="Перетащите папку сюда\nили нажмите кнопку")
         self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         btn = QPushButton("Открыть проводник")
         btn.clicked.connect(self.browse)
-        layout.addWidget(self.lbl);
+        layout.addWidget(self.lbl)
         layout.addWidget(btn)
         self.setLayout(layout)
         self.setStyleSheet("QLabel { border: 2px dashed #aaa; padding: 20px; }")
@@ -316,8 +311,33 @@ class FolderSelectDialog(QDialog):
 
 
 class ModManagerApp(QWidget):
+    def check_for_app_updates(self):
+        repo_url = "https://api.github.com/repos/1FaY1/ModManager/releases/latest"
+        try:
+            response = requests.get(repo_url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                latest_version = data.get("tag_name", "").replace("v", "")
+
+                from packaging.version import Version
+                if Version(latest_version) > Version(VERSION):
+                    reply = QMessageBox.question(
+                        self, "Обновление доступно",
+                        f"Доступна новая версия v{latest_version}!\n"
+                        f"У вас установлена v{VERSION}.\n\n"
+                        "Хотите перейти на страницу скачивания?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        import webbrowser
+                        webbrowser.open(data.get("html_url"))
+        except Exception as e:
+            print(f"Ошибка проверки обновлений программы: {e}")
+
     def __init__(self):
         super().__init__()
+        self.setStyleSheet("background-color: #1e1e1e; color: #ffffff;")
+
         self.setWindowTitle(f"Mod Manager Pro v{VERSION}")
 
         icon_path = resource_path("icon.ico")
@@ -329,6 +349,9 @@ class ModManagerApp(QWidget):
         self._init_ui()
         self.load_settings()
         self._load_api_data()
+
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(1000, self.check_for_app_updates)
 
     def load_settings(self):
         if os.path.exists(CONFIG_FILE):
@@ -360,11 +383,11 @@ class ModManagerApp(QWidget):
         self.search_btn_ui.clicked.connect(self.start_search)
         nav.addWidget(self.search_btn_ui)
 
-        self.loader_box = QComboBox();
+        self.loader_box = QComboBox()
         self.version_box = QComboBox()
-        nav.addWidget(QLabel("Загрузчик:"));
+        nav.addWidget(QLabel("Загрузчик:"))
         nav.addWidget(self.loader_box)
-        nav.addWidget(QLabel("Версия:"));
+        nav.addWidget(QLabel("Версия:"))
         nav.addWidget(self.version_box)
 
         scan_dir_btn = QPushButton("📂 Выбрать сборку")
@@ -377,32 +400,35 @@ class ModManagerApp(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         layout.addWidget(self.table)
 
 
         bottom = QHBoxLayout()
-        self.menu_btn = QPushButton("⋮");
+        self.menu_btn = QPushButton("⋮")
         self.menu_btn.setObjectName("MenuBtn")
         self.menu_btn.clicked.connect(self.select_download_folder)
 
         self.status_lbl = QLabel("Готов к работе")
         self.status_lbl.setStyleSheet("color: #7f8c8d; font-size: 11px;")
 
-        bottom.addWidget(self.menu_btn);
-        bottom.addWidget(self.status_lbl);
+        bottom.addWidget(self.menu_btn)
+        bottom.addWidget(self.status_lbl)
         bottom.addStretch()
 
         self.scan_btn = QPushButton("🔄 Проверить обновления")
-        self.scan_btn.clicked.connect(self.scan_folder);
+        self.scan_btn.clicked.connect(self.scan_folder)
         self.scan_btn.setEnabled(False)
 
         self.update_all_btn = QPushButton("⬇️ Обновить всё")
         self.update_all_btn.setStyleSheet("background-color: #2ecc71; color: white;")
-        self.update_all_btn.clicked.connect(self.update_all_mods);
+        self.update_all_btn.clicked.connect(self.update_all_mods)
         self.update_all_btn.hide()
 
-        bottom.addWidget(self.scan_btn);
+        bottom.addWidget(self.scan_btn)
         bottom.addWidget(self.update_all_btn)
         layout.addLayout(bottom)
 
@@ -421,21 +447,21 @@ class ModManagerApp(QWidget):
 
     def select_scan_folder(self):
         d = FolderSelectDialog("Выберите папку с вашими модами", self)
-        d.folder_selected.connect(self._set_scan_path);
+        d.folder_selected.connect(self._set_scan_path)
         d.exec()
 
     def _set_scan_path(self, path):
-        self.mods_folder = path;
+        self.mods_folder = path
         self.scan_btn.setEnabled(True)
         self.table.setRowCount(0)
         self.scanner = FolderScannerWorker(path, self.loader_box.currentText(), self.version_box.currentText(),
                                            check_updates=False)
-        self.scanner.mod_found.connect(self.add_mod_to_table);
+        self.scanner.mod_found.connect(self.add_mod_to_table)
         self.scanner.start()
 
     def scan_folder(self):
         if not self.mods_folder: return
-        self.table.setRowCount(0);
+        self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Проверка обновлений")
         self.scanner = FolderScannerWorker(self.mods_folder, self.loader_box.currentText(),
@@ -447,7 +473,7 @@ class ModManagerApp(QWidget):
     def select_download_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Куда скачивать моды?")
         if f:
-            self.download_folder = f;
+            self.download_folder = f
             self.status_lbl.setText(f"Загрузка в: {f}")
             with open(CONFIG_FILE, 'w') as conf: json.dump({"download_folder": f}, conf)
 
@@ -489,7 +515,7 @@ class ModManagerApp(QWidget):
     def start_search(self):
         q = self.search_input.text().strip()
         if not q: return
-        self.table.setRowCount(0);
+        self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Поиск модов")
         self.worker = ModSearchWorker(q, self.loader_box.currentText(), self.version_box.currentText())
@@ -499,7 +525,7 @@ class ModManagerApp(QWidget):
                 for r in res: self.add_mod_to_table(r)
             self.set_loading(False)
 
-        self.worker.results_ready.connect(on_done);
+        self.worker.results_ready.connect(on_done)
         self.worker.start()
 
     def add_mod_to_table(self, res):
@@ -516,7 +542,7 @@ class ModManagerApp(QWidget):
         for col, text in items:
             item = QTableWidgetItem(text)
             item.setToolTip(text)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)  # Текст по центру
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             if col == 0:
                 real_filename = res.get("display_name", res["title"])
@@ -537,8 +563,8 @@ class ModManagerApp(QWidget):
         pbar.setFixedHeight(14)
         pbar.setTextVisible(False)
         pbar_layout.addWidget(pbar)
-        pbar_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Центровка
-        pbar_layout.setContentsMargins(5, 0, 5, 0)  # Отступы, чтобы не липло к краям
+        pbar_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pbar_layout.setContentsMargins(5, 0, 5, 0)
         self.table.setCellWidget(row, 4, pbar_container)
 
         if res.get("url"):
@@ -546,25 +572,29 @@ class ModManagerApp(QWidget):
             btn_layout = QHBoxLayout(btn_container)
             btn_text = "Обновить" if res.get("needs_update") else "Скачать"
             btn = QPushButton(btn_text)
-            btn.setFixedWidth(100)  # Ограничим ширину, чтобы не растягивалась на всю ячейку
+            btn.setFixedWidth(100)
+            btn.setProperty("project_id", res.get("project_id"))
             btn.clicked.connect(partial(self.download, row, res["url"], res["filename"]))
             btn_layout.addWidget(btn)
-            btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Центровка
+            btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             btn_layout.setContentsMargins(0, 0, 0, 0)
             self.table.setCellWidget(row, 5, btn_container)
 
     def update_all_mods(self):
         """Проходит по всей таблице и нажимает кнопку 'Обновить' там, где она есть."""
         for r in range(self.table.rowCount()):
-            btn = self.table.cellWidget(r, 5)
-            if isinstance(btn, QPushButton) and btn.text() == "Обновить":
-                btn.click()
+            container = self.table.cellWidget(r, 5)
+            if container:
+                btn = container.findChild(QPushButton)
+                if btn and btn.text() == "Обновить":
+                    btn.click()
 
     def download(self, row, url, filename):
         container_btn = self.table.cellWidget(row, 5)
         btn = container_btn.findChild(QPushButton)
         if not btn: return
 
+        project_id = btn.property("project_id")
         is_update = btn.text() == "Обновить"
         save_dir = self.mods_folder if (is_update or not self.download_folder) else self.download_folder
 
@@ -572,18 +602,24 @@ class ModManagerApp(QWidget):
             QMessageBox.warning(self, "!", "Выберите папку!")
             return
 
-        base_name = filename.split('-')[0].split('_')[0]
-        try:
-            for existing_file in os.listdir(save_dir):
-                if existing_file.endswith(".jar") and base_name.lower() in existing_file.lower():
-                    old_path = os.path.join(save_dir, existing_file)
-                    # Не удаляем тот же самый файл, который скачали только что
-                    if existing_file != filename:
-                        os.remove(old_path)
-                        print(f"Удален старый конфликтный файл: {existing_file}")
-        except Exception as e:
-            print(f"Ошибка при очистке папки: {e}")
+        if project_id:
+            try:
+                v_res = requests.get(f"{MODRINTH_API}/project/{project_id}/version", headers=HEADERS, timeout=5)
+                if v_res.status_code == 200:
+                    valid_filenames = []
+                    for ver in v_res.json():
+                        for f in ver['files']:
+                            valid_filenames.append(f['filename'])
 
+                    for existing_file in os.listdir(save_dir):
+                        if existing_file in valid_filenames and existing_file != filename:
+                            old_path = os.path.join(save_dir, existing_file)
+                            os.remove(old_path)
+                            print(f"Удалена старая версия мода по ID: {existing_file}")
+            except Exception as e:
+                print(f"Ошибка точной очистки: {e}")
+
+        # Запуск загрузки
         dest = os.path.join(save_dir, filename)
         container = self.table.cellWidget(row, 4)
         pbar = container.findChild(QProgressBar)
@@ -602,8 +638,9 @@ class ModManagerApp(QWidget):
         downloader.error.connect(lambda e: (QMessageBox.critical(self, "Ошибка", e), btn.setEnabled(True)))
         self.active_downloads.append(downloader)
         downloader.start()
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv);
-    w = ModManagerApp();
-    w.show();
-    sys.exit(app.ex
+    app = QApplication(sys.argv)
+    w = ModManagerApp()
+    w.show()
+    sys.exit(app.exec())
