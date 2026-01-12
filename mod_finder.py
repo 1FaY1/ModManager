@@ -22,7 +22,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-VERSION = "1.2"
+VERSION = "1.3"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
@@ -110,7 +110,6 @@ class ModSearchWorker(QThread):
             hits = hits[:15]
             results = []
 
-
             def fetch_ver(hit):
                 v_params = {
                     "loaders": f'["{clean_loader}"]',
@@ -127,18 +126,37 @@ class ModSearchWorker(QThread):
                     if vr.status_code == 200:
                         versions = vr.json()
                         if versions:
-                            v = versions[0]
+                            # ПУНКТ 3: ЛОГИКА ПРИОРИТЕТОВ (Release -> Beta -> Alpha)
+                            selected_v = None
+
+                            # 1. Пробуем найти релиз
+                            for v in versions:
+                                if v.get("version_type") == "release":
+                                    selected_v = v
+                                    break
+
+                            # 2. Если релиза нет, ищем бету
+                            if not selected_v:
+                                for v in versions:
+                                    if v.get("version_type") == "beta":
+                                        selected_v = v
+                                        break
+
+                            # 3. Если и беты нет, берем что угодно (обычно это альфа)
+                            if not selected_v:
+                                selected_v = versions[0]
+
                             return {
                                 "title": hit["title"],
                                 "author": hit["author"],
-                                "version": v["version_number"],
-                                "url": v["files"][0]["url"],
-                                "filename": v["files"][0]["filename"],
+                                "version": selected_v["version_number"],
+                                "url": selected_v["files"][0]["url"],
+                                "filename": selected_v["files"][0]["filename"],
                                 "status": "Доступен",
                                 "needs_update": False
                             }
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Ошибка получения версии: {e}")
                 return None
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
@@ -215,12 +233,8 @@ class FolderScannerWorker(QThread):
             f_hash, filename = item
             result = {
                 "title": filename,
+                "display_name": filename,
                 "author": "-",
-                "version": "-",
-                "status": "Не опознан",
-                "url": None,
-                "filename": filename,
-                "needs_update": False
             }
 
             if f_hash in recognized:
@@ -256,7 +270,6 @@ class FolderScannerWorker(QThread):
 
             return result
 
-        # WORKER_THREADS у тебя в начале файла = 8, значит 8 проверок одновременно
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
             # Раздаем задачи
             futures = [executor.submit(process_one_mod, item) for item in hash_to_file.items()]
@@ -307,7 +320,6 @@ class ModManagerApp(QWidget):
         super().__init__()
         self.setWindowTitle(f"Mod Manager Pro v{VERSION}")
 
-        # ВСТАВЬ ЭТИ СТРОКИ ЗДЕСЬ:
         icon_path = resource_path("icon.ico")
         self.setWindowIcon(QIcon(icon_path))
 
@@ -494,39 +506,52 @@ class ModManagerApp(QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
-        name_item = QTableWidgetItem(res["title"])
-        name_item.setToolTip(res["title"])  # Показывает полное имя при наведении
-        self.table.setItem(row, 0, name_item)
+        items = [
+            (0, res["title"]),
+            (1, res["author"]),
+            (2, res["version"]),
+            (3, res["status"])
+        ]
 
-        auth_item = QTableWidgetItem(res["author"])
-        auth_item.setToolTip(res["author"])
-        self.table.setItem(row, 1, auth_item)
+        for col, text in items:
+            item = QTableWidgetItem(text)
+            item.setToolTip(text)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)  # Текст по центру
 
-        ver_item = QTableWidgetItem(res["version"])
-        ver_item.setToolTip(res["version"])
-        self.table.setItem(row, 2, ver_item)
+            if col == 0:
+                real_filename = res.get("display_name", res["title"])
+                item.setData(Qt.ItemDataRole.UserRole, real_filename)
 
-        st_item = QTableWidgetItem(res["status"])
-        st_item.setToolTip(res["status"])
+            if col == 3:
+                if res.get("needs_update"):
+                    item.setForeground(QColor("#e67e22"))
+                    self.update_all_btn.show()
+                elif "Актуально" in res["status"] or "Загружен" in res["status"]:
+                    item.setForeground(QColor("#27ae60"))
 
-        if res.get("needs_update"):
-            st_item.setForeground(QColor("#e67e22"))
-            self.update_all_btn.show()
-        elif "Актуально" in res["status"] or "Загружен" in res["status"]:
-            st_item.setForeground(QColor("#27ae60"))
+            self.table.setItem(row, col, item)
 
-        self.table.setItem(row, 3, st_item)
-
+        pbar_container = QWidget()
+        pbar_layout = QHBoxLayout(pbar_container)
         pbar = QProgressBar()
-        pbar.setFixedHeight(12)
+        pbar.setFixedHeight(14)
         pbar.setTextVisible(False)
-        self.table.setCellWidget(row, 4, pbar)
+        pbar_layout.addWidget(pbar)
+        pbar_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Центровка
+        pbar_layout.setContentsMargins(5, 0, 5, 0)  # Отступы, чтобы не липло к краям
+        self.table.setCellWidget(row, 4, pbar_container)
 
         if res.get("url"):
+            btn_container = QWidget()
+            btn_layout = QHBoxLayout(btn_container)
             btn_text = "Обновить" if res.get("needs_update") else "Скачать"
             btn = QPushButton(btn_text)
+            btn.setFixedWidth(100)  # Ограничим ширину, чтобы не растягивалась на всю ячейку
             btn.clicked.connect(partial(self.download, row, res["url"], res["filename"]))
-            self.table.setCellWidget(row, 5, btn)
+            btn_layout.addWidget(btn)
+            btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Центровка
+            btn_layout.setContentsMargins(0, 0, 0, 0)
+            self.table.setCellWidget(row, 5, btn_container)
 
     def update_all_mods(self):
         """Проходит по всей таблице и нажимает кнопку 'Обновить' там, где она есть."""
@@ -536,31 +561,49 @@ class ModManagerApp(QWidget):
                 btn.click()
 
     def download(self, row, url, filename):
-        """Метод для скачивания мода."""
-        save_dir = self.download_folder if self.download_folder else self.mods_folder
+        container_btn = self.table.cellWidget(row, 5)
+        btn = container_btn.findChild(QPushButton)
+        if not btn: return
+
+        is_update = btn.text() == "Обновить"
+        save_dir = self.mods_folder if (is_update or not self.download_folder) else self.download_folder
+
         if not save_dir:
-            QMessageBox.warning(self, "!", "Выберите папку для сохранения!");
+            QMessageBox.warning(self, "!", "Выберите папку!")
             return
 
-        dest = os.path.join(save_dir, filename)
-        pbar = self.table.cellWidget(row, 4)
-        btn = self.table.cellWidget(row, 5)
+        base_name = filename.split('-')[0].split('_')[0]
+        try:
+            for existing_file in os.listdir(save_dir):
+                if existing_file.endswith(".jar") and base_name.lower() in existing_file.lower():
+                    old_path = os.path.join(save_dir, existing_file)
+                    # Не удаляем тот же самый файл, который скачали только что
+                    if existing_file != filename:
+                        os.remove(old_path)
+                        print(f"Удален старый конфликтный файл: {existing_file}")
+        except Exception as e:
+            print(f"Ошибка при очистке папки: {e}")
 
+        dest = os.path.join(save_dir, filename)
+        container = self.table.cellWidget(row, 4)
+        pbar = container.findChild(QProgressBar)
         btn.setEnabled(False)
+
         downloader = DownloadThread(url, dest)
         downloader.progress.connect(pbar.setValue)
 
         def on_done(path):
             btn.setText("Ок")
+            self.table.item(row, 0).setText(filename)
+            self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filename)
             self.status_lbl.setText(f"Скачано: {filename}")
 
         downloader.finished.connect(on_done)
-        downloader.error.connect(lambda e: QMessageBox.critical(self, "Ошибка", e))
-
-        self.active_downloads.append(downloader)  # Чтобы поток не удалился из памяти
+        downloader.error.connect(lambda e: (QMessageBox.critical(self, "Ошибка", e), btn.setEnabled(True)))
+        self.active_downloads.append(downloader)
         downloader.start()
 if __name__ == "__main__":
     app = QApplication(sys.argv);
     w = ModManagerApp();
     w.show();
-    sys.exit(app.exec())
+    sys.exit(app.ex
