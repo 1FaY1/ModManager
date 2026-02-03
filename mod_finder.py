@@ -1,7 +1,6 @@
 import sys
 import os
 import requests
-import hashlib
 import json
 import concurrent.futures
 from functools import partial
@@ -12,7 +11,9 @@ from PyQt6.QtWidgets import (
     QLabel, QProgressBar, QHeaderView, QDialog, QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon # Добавили QIcon
+from PyQt6.QtGui import QColor, QIcon
+
+from utils import get_file_hash
 
 def resource_path(relative_path):
     """ Функция для поиска иконки внутри собранного EXE """
@@ -27,18 +28,6 @@ MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
 CONFIG_FILE = "mod_manager_config.json"
-
-
-def get_file_hash(path):
-    sha1 = hashlib.sha1()
-    try:
-        with open(path, 'rb') as f:
-            while chunk := f.read(8192):
-                sha1.update(chunk)
-        return sha1.hexdigest()
-    except:
-        return None
-
 
 class DownloadThread(QThread):
     progress = pyqtSignal(int)
@@ -232,6 +221,8 @@ class FolderScannerWorker(QThread):
                 "title": filename,
                 "display_name": filename,
                 "author": "-",
+                "version": "-",
+                "status": "Неизвестно",
             }
 
             if f_hash in recognized:
