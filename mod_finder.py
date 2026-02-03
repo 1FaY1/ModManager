@@ -10,10 +10,11 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTableWidget,
     QTableWidgetItem, QFileDialog, QMessageBox,
-    QLabel, QProgressBar, QHeaderView, QDialog, QAbstractItemView
+    QLabel, QProgressBar, QHeaderView, QDialog, QAbstractItemView,
+    QToolButton, QMenu
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon
+from PyQt6.QtGui import QColor, QIcon, QAction
 
 from utils import get_file_hash
 
@@ -357,6 +358,7 @@ class ModManagerApp(QWidget):
         self.resize(1100, 650)
         self.mods_folder, self.download_folder, self.active_downloads = "", "", []
         self.updated_mods = set()
+        self.track_updated_mods = True
 
         self._init_ui()
         self.load_settings()
@@ -435,19 +437,32 @@ class ModManagerApp(QWidget):
         self.scan_btn.clicked.connect(self.scan_folder)
         self.scan_btn.setEnabled(False)
 
-        self.update_all_btn = QPushButton("⬇️ Обновить всё")
-        self.update_all_btn.setStyleSheet("background-color: #2ecc71; color: white;")
+        self.update_all_btn = QToolButton()
+        self.update_all_btn.setObjectName("UpdateAllBtn")
+        self.update_all_btn.setText("⬇️ Обновить всё  ☰")
+        self.update_all_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.update_all_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.update_all_btn.setStyleSheet(
+            "QToolButton#UpdateAllBtn { background-color: #2ecc71; color: white; padding: 6px 12px; }"
+            "QToolButton#UpdateAllBtn::menu-button { width: 18px; }"
+        )
         self.update_all_btn.clicked.connect(self.update_all_mods)
         self.update_all_btn.hide()
-        self.update_menu_btn = QPushButton("⋮")
-        self.update_menu_btn.setFixedWidth(28)
-        self.update_menu_btn.setToolTip("Дополнительные действия")
-        self.update_menu_btn.clicked.connect(self.backup_updated_mods)
-        self.update_menu_btn.hide()
+        update_menu = QMenu(self)
+        backup_action = QAction("Резервное копирование", self)
+        backup_action.triggered.connect(self.backup_updated_mods)
+        update_menu.addAction(backup_action)
+
+        track_updates_action = QAction("Запоминать обновленные моды", self)
+        track_updates_action.setCheckable(True)
+        track_updates_action.setChecked(True)
+        track_updates_action.toggled.connect(lambda enabled: setattr(self, "track_updated_mods", enabled))
+        update_menu.addAction(track_updates_action)
+
+        self.update_all_btn.setMenu(update_menu)
 
         bottom.addWidget(self.scan_btn)
         bottom.addWidget(self.update_all_btn)
-        bottom.addWidget(self.update_menu_btn)
         layout.addLayout(bottom)
 
     def set_loading(self, loading, msg=""):
@@ -481,7 +496,6 @@ class ModManagerApp(QWidget):
         if not self.mods_folder: return
         self.table.setRowCount(0)
         self.update_all_btn.hide()
-        self.update_menu_btn.hide()
         self.set_loading(True, "Проверка обновлений")
         self.scanner = FolderScannerWorker(self.mods_folder, self.loader_box.currentText(),self.version_box.currentText(), check_updates=True)
         self.scanner.mod_found.connect(self.add_mod_to_table)
@@ -537,6 +551,7 @@ class ModManagerApp(QWidget):
         self.update_all_btn.hide()
         self.set_loading(True, "Поиск модов")
         self.worker = ModSearchWorker(q, self.loader_box.currentText(), self.version_box.currentText())
+        self.worker = ModSearchWorker(q, self.loader_box.currentText(), self.version_box.currentText())
 
         def on_done(res, ok):
             if ok:
@@ -570,7 +585,6 @@ class ModManagerApp(QWidget):
                 if res.get("needs_update"):
                     item.setForeground(QColor("#e67e22"))
                     self.update_all_btn.show()
-                    self.update_menu_btn.show()
                 elif "Актуально" in res["status"] or "Загружен" in res["status"]:
                     item.setForeground(QColor("#27ae60"))
 
@@ -662,7 +676,7 @@ class ModManagerApp(QWidget):
             self.table.item(row, 0).setText(filename)
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filename)
             self.status_lbl.setText(f"Скачано: {filename}")
-            if is_update and needs_update:
+            if is_update and needs_update and self.track_updated_mods:
                 self.updated_mods.add(filename)
 
         downloader.finished.connect(on_done)
@@ -690,11 +704,14 @@ class ModManagerApp(QWidget):
                 shutil.copy2(src, os.path.join(backup_dir, filename))
                 copied += 1
 
-        QMessageBox.information(
-            self,
-            "Резервное копирование",
-            f"Скопировано файлов: {copied}"
-        )
+                QMessageBox.information(
+                self,
+                "Резервное копирование",
+                f"Скопировано файлов: {copied}"
+                )
+
+        def _set_track_updated_mods(self, enabled):
+            self.track_updated_mods = enabled
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
