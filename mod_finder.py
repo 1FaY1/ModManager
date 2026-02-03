@@ -26,7 +26,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-VERSION = "1.3"
+VERSION = "1.4"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
@@ -439,12 +439,11 @@ class ModManagerApp(QWidget):
 
         self.update_all_btn = QToolButton()
         self.update_all_btn.setObjectName("UpdateAllBtn")
-        self.update_all_btn.setText("⬇️ Обновить всё  ☰")
-        self.update_all_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.update_all_btn.setText("⬇️ Обновить всё")
+        self.update_all_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.update_all_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.update_all_btn.setStyleSheet(
             "QToolButton#UpdateAllBtn { background-color: #2ecc71; color: white; padding: 6px 12px; }"
-            "QToolButton#UpdateAllBtn::menu-button { width: 18px; }"
         )
         self.update_all_btn.clicked.connect(self.update_all_mods)
         self.update_all_btn.hide()
@@ -644,22 +643,53 @@ class ModManagerApp(QWidget):
 
         if project_id and is_update and needs_update:
             try:
-                v_res = requests.get(
-                    f"{MODRINTH_API}/project/{project_id}/version",
-                    headers=HEADERS,
-                    timeout=5
-                )
-                if v_res.status_code == 200:
-                    valid_filenames = []
-                    for ver in v_res.json():
-                        for f in ver['files']:
-                            valid_filenames.append(f['filename'])
+                candidate_files = [
+                    f for f in os.listdir(save_dir)
+                    if f.endswith(".jar") and f != filename
+                ]
+                hash_to_file = {}
+                for existing_file in candidate_files:
+                    existing_path = os.path.join(save_dir, existing_file)
+                    file_hash = get_file_hash(existing_path)
+                    if file_hash:
+                        hash_to_file[file_hash] = existing_file
 
-                    for existing_file in os.listdir(save_dir):
-                        if existing_file in valid_filenames and existing_file != filename:
-                            old_path = os.path.join(save_dir, existing_file)
-                            os.remove(old_path)
-                            print(f"Удалена старая версия мода по ID: {existing_file}")
+                recognized_processed = False
+                if hash_to_file:
+                    r = requests.post(
+                        f"{MODRINTH_API}/version_files",
+                        json={"hashes": list(hash_to_file.keys()), "algorithm": "sha1"},
+                        headers=HEADERS,
+                        timeout=15
+                    )
+                    if r.status_code == 200:
+                        recognized = r.json()
+                        for file_hash, data in recognized.items():
+                            if data.get("project_id") == project_id:
+                                old_file = hash_to_file.get(file_hash)
+                                if old_file and old_file != filename:
+                                    old_path = os.path.join(save_dir, old_file)
+                                    os.remove(old_path)
+                                    print(f"Удалена старая версия мода по ID: {old_file}")
+                        recognized_processed = True
+
+                if not recognized_processed:
+                    v_res = requests.get(
+                        f"{MODRINTH_API}/project/{project_id}/version",
+                        headers=HEADERS,
+                        timeout=5
+                    )
+                    if v_res.status_code == 200:
+                        valid_filenames = []
+                        for ver in v_res.json():
+                            for f in ver['files']:
+                                valid_filenames.append(f['filename'])
+
+                        for existing_file in os.listdir(save_dir):
+                            if existing_file in valid_filenames and existing_file != filename:
+                                old_path = os.path.join(save_dir, existing_file)
+                                os.remove(old_path)
+                                print(f"Удалена старая версия мода по ID: {existing_file}")
             except Exception as e:
                 print(f"Ошибка точной очистки: {e}")
 
