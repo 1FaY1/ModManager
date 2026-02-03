@@ -3,6 +3,9 @@ import os
 import requests
 import json
 import concurrent.futures
+import re
+from functools import partial
+from distutils.version import LooseVersion
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTableWidget,
@@ -27,6 +30,24 @@ MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
 CONFIG_FILE = "mod_manager_config.json"
+
+_VERSION_RE = re.compile(r"(\d+|[a-zA-Z]+)")
+
+
+def _version_key(raw_version):
+    if not raw_version:
+        return ()
+    parts = []
+    for part in _VERSION_RE.findall(raw_version):
+        if part.isdigit():
+            parts.append((0, int(part)))
+        else:
+            parts.append((1, part.lower()))
+    return tuple(parts)
+
+
+def is_version_newer(latest_version, current_version):
+    return _version_key(latest_version) > _version_key(current_version)
 
 class DownloadThread(QThread):
     progress = pyqtSignal(int)
@@ -309,8 +330,7 @@ class ModManagerApp(QWidget):
                 data = response.json()
                 latest_version = data.get("tag_name", "").replace("v", "")
 
-                from packaging.version import Version
-                if Version(latest_version) > Version(VERSION):
+                if latest_version and is_version_newer(latest_version, VERSION):
                     reply = QMessageBox.question(
                         self, "Обновление доступно",
                         f"Доступна новая версия v{latest_version}!\n"
