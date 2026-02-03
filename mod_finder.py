@@ -4,8 +4,8 @@ import requests
 import json
 import concurrent.futures
 import re
+import shutil
 from functools import partial
-from distutils.version import LooseVersion
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTableWidget,
@@ -156,6 +156,7 @@ class ModSearchWorker(QThread):
                                 "title": hit["title"],
                                 "author": hit["author"],
                                 "version": selected_v["version_number"],
+                                "project_id": hit["project_id"],
                                 "url": selected_v["files"][0]["url"],
                                 "filename": selected_v["files"][0]["filename"],
                                 "status": "Доступен",
@@ -355,6 +356,7 @@ class ModManagerApp(QWidget):
 
         self.resize(1100, 650)
         self.mods_folder, self.download_folder, self.active_downloads = "", "", []
+        self.updated_mods = set()
 
         self._init_ui()
         self.load_settings()
@@ -437,9 +439,15 @@ class ModManagerApp(QWidget):
         self.update_all_btn.setStyleSheet("background-color: #2ecc71; color: white;")
         self.update_all_btn.clicked.connect(self.update_all_mods)
         self.update_all_btn.hide()
+        self.update_menu_btn = QPushButton("⋮")
+        self.update_menu_btn.setFixedWidth(28)
+        self.update_menu_btn.setToolTip("Дополнительные действия")
+        self.update_menu_btn.clicked.connect(self.backup_updated_mods)
+        self.update_menu_btn.hide()
 
         bottom.addWidget(self.scan_btn)
         bottom.addWidget(self.update_all_btn)
+        bottom.addWidget(self.update_menu_btn)
         layout.addLayout(bottom)
 
     def set_loading(self, loading, msg=""):
@@ -473,9 +481,9 @@ class ModManagerApp(QWidget):
         if not self.mods_folder: return
         self.table.setRowCount(0)
         self.update_all_btn.hide()
+        self.update_menu_btn.hide()
         self.set_loading(True, "Проверка обновлений")
-        self.scanner = FolderScannerWorker(self.mods_folder, self.loader_box.currentText(),
-                                           self.version_box.currentText(), check_updates=True)
+        self.scanner = FolderScannerWorker(self.mods_folder, self.loader_box.currentText(),self.version_box.currentText(), check_updates=True)
         self.scanner.mod_found.connect(self.add_mod_to_table)
         self.scanner.finished.connect(lambda: self.set_loading(False))
         self.scanner.start()
@@ -562,6 +570,7 @@ class ModManagerApp(QWidget):
                 if res.get("needs_update"):
                     item.setForeground(QColor("#e67e22"))
                     self.update_all_btn.show()
+                    self.update_menu_btn.show()
                 elif "Актуально" in res["status"] or "Загружен" in res["status"]:
                     item.setForeground(QColor("#27ae60"))
 
@@ -584,7 +593,13 @@ class ModManagerApp(QWidget):
             btn = QPushButton(btn_text)
             btn.setFixedWidth(100)
             btn.setProperty("project_id", res.get("project_id"))
-            btn.clicked.connect(partial(self.download, row, res["url"], res["filename"]))
+            btn.clicked.connect(partial(
+                self.download,
+                row,
+                res["url"],
+                res["filename"],
+                bool(res.get("needs_update"))
+            ))
             btn_layout.addWidget(btn)
             btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             btn_layout.setContentsMargins(0, 0, 0, 0)
@@ -599,20 +614,20 @@ class ModManagerApp(QWidget):
                 if btn and btn.text() == "Обновить":
                     btn.click()
 
-    def download(self, row, url, filename):
-        container_btn = self.table.cellWidget(row, 5)
-        btn = container_btn.findChild(QPushButton)
-        if not btn: return
+        def download(self, row, url, filename, needs_update):
+            container_btn = self.table.cellWidget(row, 5)
+            btn = container_btn.findChild(QPushButton)
+            if not btn: return
 
-        project_id = btn.property("project_id")
-        is_update = btn.text() == "Обновить"
-        save_dir = self.mods_folder if (is_update or not self.download_folder) else self.download_folder
+            project_id = btn.property("project_id")
+            is_update = btn.text() == "Обновить"
+            save_dir = self.mods_folder if (is_update or not self.download_folder) else self.download_folder
 
         if not save_dir:
             QMessageBox.warning(self, "!", "Выберите папку!")
             return
 
-        if project_id:
+        if project_id and is_update and needs_update:
             try:
                 v_res = requests.get(f"{MODRINTH_API}/project/{project_id}/version", headers=HEADERS, timeout=5)
                 if v_res.status_code == 200:
@@ -642,11 +657,39 @@ class ModManagerApp(QWidget):
             self.table.item(row, 0).setText(filename)
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filename)
             self.status_lbl.setText(f"Скачано: {filename}")
+            if is_update and needs_update:
+                self.updated_mods.add(filename)
 
         downloader.finished.connect(on_done)
         downloader.error.connect(lambda e: (QMessageBox.critical(self, "Ошибка", e), btn.setEnabled(True)))
         self.active_downloads.append(downloader)
         downloader.start()
+
+    def backup_updated_mods(self):
+        if not self.updated_mods:
+            QMessageBox.information(self, "Резервное копирование", "Нет обновленных модов для копирования.")
+            return
+
+        if not self.mods_folder:
+            QMessageBox.warning(self, "Резервное копирование", "Сначала выберите папку с модами.")
+            return
+
+        backup_dir = QFileDialog.getExistingDirectory(self, "Выберите папку для резервных копий")
+        if not backup_dir:
+            return
+
+        copied = 0
+        for filename in sorted(self.updated_mods):
+            src = os.path.join(self.mods_folder, filename)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(backup_dir, filename))
+                copied += 1
+
+        QMessageBox.information(
+            self,
+            "Резервное копирование",
+            f"Скопировано файлов: {copied}"
+        )
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
