@@ -614,14 +614,15 @@ class ModManagerApp(QWidget):
                 if btn and btn.text() == "Обновить":
                     btn.click()
 
-        def download(self, row, url, filename, needs_update):
-            container_btn = self.table.cellWidget(row, 5)
-            btn = container_btn.findChild(QPushButton)
-            if not btn: return
+    def download(self, row, url, filename, needs_update):
+        container_btn = self.table.cellWidget(row, 5)
+        btn = container_btn.findChild(QPushButton)
+        if not btn:
+            return
 
-            project_id = btn.property("project_id")
-            is_update = btn.text() == "Обновить"
-            save_dir = self.mods_folder if (is_update or not self.download_folder) else self.download_folder
+        project_id = btn.property("project_id")
+        is_update = btn.text() == "Обновить"
+        save_dir = self.mods_folder if (is_update or not self.download_folder) else self.download_folder
 
         if not save_dir:
             QMessageBox.warning(self, "!", "Выберите папку!")
@@ -629,7 +630,11 @@ class ModManagerApp(QWidget):
 
         if project_id and is_update and needs_update:
             try:
-                v_res = requests.get(f"{MODRINTH_API}/project/{project_id}/version", headers=HEADERS, timeout=5)
+                v_res = requests.get(
+                    f"{MODRINTH_API}/project/{project_id}/version",
+                    headers=HEADERS,
+                    timeout=5
+                )
                 if v_res.status_code == 200:
                     valid_filenames = []
                     for ver in v_res.json():
