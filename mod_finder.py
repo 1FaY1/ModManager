@@ -3,7 +3,6 @@ import os
 import requests
 import json
 import concurrent.futures
-from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTableWidget,
@@ -610,7 +609,6 @@ class ModManagerApp(QWidget):
             except Exception as e:
                 print(f"Ошибка точной очистки: {e}")
 
-        # Запуск загрузки
         dest = os.path.join(save_dir, filename)
         container = self.table.cellWidget(row, 4)
         pbar = container.findChild(QProgressBar)
