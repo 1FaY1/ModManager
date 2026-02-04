@@ -28,7 +28,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-VERSION = "1.4"
+VERSION = "1.5"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
@@ -325,49 +325,66 @@ class FolderSelectDialog(QDialog):
         if os.path.isdir(path): self.folder_selected.emit(path); self.accept()
 
 
-class ModManagerApp(QWidget):
-    def check_for_app_updates(self):
+class AppUpdateWorker(QThread):
+    update_found = pyqtSignal(str)
+
+    def run(self):
         repo_url = "https://api.github.com/repos/1FaY1/ModManager/releases/latest"
         try:
-            response = requests.get(repo_url, timeout=3)
+            response = requests.get(repo_url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
                 remote_version = data.get("tag_name", "").lstrip("v")
 
                 if remote_version and is_version_newer(remote_version, VERSION):
-                    reply = QMessageBox.question(
-                        self, "Обновление доступно",
-                        f"Доступна новая версия v{remote_version}!\n"
-                        f"У вас установлена v{VERSION}.\n\n"
-                        "Хотите перейти на страницу скачивания?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
-                        import webbrowser
-                        webbrowser.open("https://github.com/1FaY1/ModManager/releases")
+                    self.update_found.emit(remote_version)
         except Exception as e:
-            print(f"Ошибка проверки обновлений программы: {e}")
+            print(f"Update check failed: {e}")
+
+
+class ModManagerApp(QWidget):
+    def ask_for_update(self, remote_version):
+        reply = QMessageBox.question(
+            self, "Обновление доступно",
+            f"Доступна новая версия v{remote_version}!\n"
+            f"У вас установлена v{VERSION}.\n\n"
+            "Хотите перейти на страницу скачивания?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            import webbrowser
+            webbrowser.open("https://github.com/1FaY1/ModManager/releases")
+
+    def save_config(self):
+        """Централизованное сохранение настроек в JSON файл"""
+        try:
+            with open(CONFIG_FILE, 'w') as conf:
+                json.dump({
+                    "download_folder": self.download_folder,
+                    "backup_folder": self.backup_folder
+                }, conf)
+        except Exception as e:
+            print(f"Ошибка сохранения конфига: {e}")
 
     def __init__(self):
         super().__init__()
         self.setStyleSheet("background-color: #1e1e1e; color: #ffffff;")
-
         self.setWindowTitle(f"Mod Manager Pro v{VERSION}")
 
         icon_path = resource_path("icon.ico")
         self.setWindowIcon(QIcon(icon_path))
 
         self.resize(1100, 650)
-        self.mods_folder, self.download_folder, self.active_downloads = "", "", []
-        self.updated_mods = set()
-        self.track_updated_mods = True
+        self.mods_folder, self.download_folder, self.backup_folder = "", "", ""
+        self.active_downloads = []
 
         self._init_ui()
         self.load_settings()
         self._load_api_data()
 
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(1000, self.check_for_app_updates)
+        self.update_worker = AppUpdateWorker()
+        self.update_worker.update_found.connect(self.ask_for_update)
+        self.update_worker.start()
 
     def load_settings(self):
         if os.path.exists(CONFIG_FILE):
@@ -375,7 +392,9 @@ class ModManagerApp(QWidget):
                 with open(CONFIG_FILE, 'r') as f:
                     config = json.load(f)
                     self.download_folder = config.get("download_folder", "")
-                    if self.download_folder: self.status_lbl.setText(f"Загрузка в: {self.download_folder}")
+                    self.backup_folder = config.get("backup_folder", "")
+                    if self.download_folder:
+                        self.status_lbl.setText(f"Загрузка в: {self.download_folder}")
             except:
                 pass
 
@@ -448,27 +467,38 @@ class ModManagerApp(QWidget):
         )
         self.update_all_btn.clicked.connect(self.update_all_mods)
         self.update_all_btn.hide()
+
         update_menu = QMenu(self)
+
         self.backup_before_update_action = QAction("Резервное копирование перед обновлением", self)
         self.backup_before_update_action.setCheckable(True)
-        self.backup_before_update_action.setChecked(False)
+        self.backup_before_update_action.setChecked(True)
+        # Подсказки
+        self.backup_before_update_action.setStatusTip("Сохраняет старые версии файлов в папку 'backups' перед заменой")
+        self.backup_before_update_action.setToolTip(
+            "Безопасное обновление: копия старого мода сохранится автоматически")
         update_menu.addAction(self.backup_before_update_action)
 
-        backup_action = QAction("Резервное копирование", self)
-        backup_action.triggered.connect(self.backup_updated_mods)
-        update_menu.addAction(backup_action)
+        update_menu.addSeparator()
 
-        track_updates_action = QAction("Запоминать обновленные моды", self)
-        track_updates_action.setCheckable(True)
-        track_updates_action.setChecked(True)
-        track_updates_action.toggled.connect(lambda enabled: setattr(self, "track_updated_mods", enabled))
-        update_menu.addAction(track_updates_action)
+        # Пункт с тремя точками
+        self.select_backup_dir_action = QAction("⋮ Выбрать папку для бэкапов...", self)
+        self.select_backup_dir_action.triggered.connect(self.select_custom_backup_folder)
+        update_menu.addAction(self.select_backup_dir_action)
 
         self.update_all_btn.setMenu(update_menu)
 
         bottom.addWidget(self.scan_btn)
         bottom.addWidget(self.update_all_btn)
         layout.addLayout(bottom)
+
+    def select_custom_backup_folder(self):
+        """Выбор кастомной папки для бэкапов (в меню кнопки Обновить всё)"""
+        f = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения бэкапов")
+        if f:
+            self.backup_folder = f
+            self.status_lbl.setText(f"Папка бэкапов: {f}")
+            self.save_config()
 
     def set_loading(self, loading, msg=""):
         """Визуальный индикатор работы."""
@@ -509,11 +539,12 @@ class ModManagerApp(QWidget):
         self.scanner.start()
 
     def select_download_folder(self):
+        """Выбор папки, куда качать новые моды (по нажатию на ⋮ внизу)"""
         f = QFileDialog.getExistingDirectory(self, "Куда скачивать моды?")
         if f:
             self.download_folder = f
             self.status_lbl.setText(f"Загрузка в: {f}")
-            with open(CONFIG_FILE, 'w') as conf: json.dump({"download_folder": f}, conf)
+            self.save_config()
 
     def _load_api_data(self):
         """Загружаем версии игры и загрузчики с обработкой ошибок."""
@@ -556,7 +587,6 @@ class ModManagerApp(QWidget):
         self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Поиск модов")
-        self.worker = ModSearchWorker(q, self.loader_box.currentText(), self.version_box.currentText())
         self.worker = ModSearchWorker(q, self.loader_box.currentText(), self.version_box.currentText())
 
         def on_done(res, ok):
@@ -630,7 +660,21 @@ class ModManagerApp(QWidget):
     def update_all_mods(self):
         if self.backup_before_update_action.isChecked():
             if not self.mods_folder:
-                QMessageBox.warning(self, "Резервное копирование", "Сначала выберите папку с модами.")
+                QMessageBox.warning(self, "Ошибка", "Не выбрана рабочая папка с модами.")
+                return
+
+            if self.backup_folder:
+                target_backup_dir = self.backup_folder
+            elif self.download_folder:
+                target_backup_dir = os.path.join(self.download_folder, "backups")
+            else:
+                target_backup_dir = os.path.join(self.mods_folder, "backups")
+
+            try:
+                if not os.path.exists(target_backup_dir):
+                    os.makedirs(target_backup_dir)
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось создать папку бэкапа: {e}")
                 return
 
             mods_to_backup = []
@@ -640,30 +684,18 @@ class ModManagerApp(QWidget):
                     btn = container.findChild(QPushButton)
                     if btn and btn.text() == "Обновить":
                         item = self.table.item(r, 0)
-                        original_filename = item.data(Qt.ItemDataRole.UserRole) if item else None
+                        original_filename = item.data(Qt.ItemDataRole.UserRole)
                         if original_filename:
                             mods_to_backup.append(original_filename)
 
             if mods_to_backup:
-                backup_dir = QFileDialog.getExistingDirectory(self, "Выберите папку для резервных копий")
-                if not backup_dir:
-                    return
-
-                copied = 0
-                missing = 0
                 for filename in mods_to_backup:
                     src = os.path.join(self.mods_folder, filename)
                     if os.path.exists(src):
-                        shutil.copy2(src, os.path.join(backup_dir, filename))
-                        copied += 1
-                    else:
-                        missing += 1
-
-                QMessageBox.information(
-                    self,
-                    "Резервное копирование",
-                    f"Скопировано файлов: {copied}\nОтсутствовало файлов: {missing}"
-                )
+                        try:
+                            shutil.copy2(src, os.path.join(target_backup_dir, filename))
+                        except:
+                            pass
 
         for r in range(self.table.rowCount()):
             container = self.table.cellWidget(r, 5)
@@ -746,16 +778,26 @@ class ModManagerApp(QWidget):
         downloader = DownloadThread(url, dest)
         downloader.progress.connect(pbar.setValue)
 
+        def cleanup():
+            if downloader in self.active_downloads:
+                self.active_downloads.remove(downloader)
+                print(f"Поток для {filename} очищен из памяти.")
+
         def on_done(path):
             btn.setText("Ок")
             self.table.item(row, 0).setText(filename)
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filename)
             self.status_lbl.setText(f"Скачано: {filename}")
-            if is_update and needs_update and self.track_updated_mods:
-                self.updated_mods.add(filename)
+            cleanup()
+
+        def on_error(err_msg):
+            QMessageBox.critical(self, "Ошибка", err_msg)
+            btn.setEnabled(True)
+            cleanup()
 
         downloader.finished.connect(on_done)
-        downloader.error.connect(lambda e: (QMessageBox.critical(self, "Ошибка", e), btn.setEnabled(True)))
+        downloader.error.connect(on_error)
+
         self.active_downloads.append(downloader)
         downloader.start()
 
@@ -785,7 +827,7 @@ class ModManagerApp(QWidget):
                     copied += 1
                 except Exception as e:
                     print(f"Ошибка копирования {filename}: {e}")
-                    errors.append(filename)
+                    errors.append(f"{filename} ({str(e)})")
 
         msg = f"Успешно скопировано файлов: {copied}"
         if errors:
@@ -794,12 +836,9 @@ class ModManagerApp(QWidget):
             if len(errors) > 5:
                 msg += "\n... и другие."
 
-            QMessageBox.warning(self, "Результат копирования", msg)
+            QMessageBox.warning(self, "Результат копирования с ошибками", msg)
         else:
             QMessageBox.information(self, "Резервное копирование", msg)
-
-    def _set_track_updated_mods(self, enabled):
-        self.track_updated_mods = enabled
 
 
 if __name__ == "__main__":
