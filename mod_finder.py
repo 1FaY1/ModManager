@@ -18,6 +18,7 @@ from PyQt6.QtGui import QColor, QIcon, QAction
 
 from utils import get_file_hash
 
+
 def resource_path(relative_path):
     """ Функция для поиска иконки внутри собранного EXE """
     try:
@@ -25,6 +26,7 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
 
 VERSION = "1.4"
 MODRINTH_API = "https://api.modrinth.com/v2"
@@ -49,6 +51,7 @@ def _version_key(raw_version):
 
 def is_version_newer(latest_version, current_version):
     return _version_key(latest_version) > _version_key(current_version)
+
 
 class DownloadThread(QThread):
     progress = pyqtSignal(int)
@@ -100,7 +103,6 @@ class ModSearchWorker(QThread):
                 "index": "relevance",
                 "facets": f"[{','.join(facets)}]"
             }
-
 
             r = requests.get(f"{MODRINTH_API}/search", params=params, headers=HEADERS, timeout=10)
             r.raise_for_status()
@@ -420,7 +422,6 @@ class ModManagerApp(QWidget):
 
         layout.addWidget(self.table)
 
-
         bottom = QHBoxLayout()
         self.menu_btn = QPushButton("⋮")
         self.menu_btn.setObjectName("MenuBtn")
@@ -448,6 +449,11 @@ class ModManagerApp(QWidget):
         self.update_all_btn.clicked.connect(self.update_all_mods)
         self.update_all_btn.hide()
         update_menu = QMenu(self)
+        self.backup_before_update_action = QAction("Резервное копирование перед обновлением", self)
+        self.backup_before_update_action.setCheckable(True)
+        self.backup_before_update_action.setChecked(False)
+        update_menu.addAction(self.backup_before_update_action)
+
         backup_action = QAction("Резервное копирование", self)
         backup_action.triggered.connect(self.backup_updated_mods)
         update_menu.addAction(backup_action)
@@ -496,7 +502,8 @@ class ModManagerApp(QWidget):
         self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Проверка обновлений")
-        self.scanner = FolderScannerWorker(self.mods_folder, self.loader_box.currentText(),self.version_box.currentText(), check_updates=True)
+        self.scanner = FolderScannerWorker(self.mods_folder, self.loader_box.currentText(),
+                                           self.version_box.currentText(), check_updates=True)
         self.scanner.mod_found.connect(self.add_mod_to_table)
         self.scanner.finished.connect(lambda: self.set_loading(False))
         self.scanner.start()
@@ -618,8 +625,46 @@ class ModManagerApp(QWidget):
             btn_layout.setContentsMargins(0, 0, 0, 0)
             self.table.setCellWidget(row, 5, btn_container)
 
+        self.table.scrollToBottom()
+
     def update_all_mods(self):
-        """Проходит по всей таблице и нажимает кнопку 'Обновить' там, где она есть."""
+        if self.backup_before_update_action.isChecked():
+            if not self.mods_folder:
+                QMessageBox.warning(self, "Резервное копирование", "Сначала выберите папку с модами.")
+                return
+
+            mods_to_backup = []
+            for r in range(self.table.rowCount()):
+                container = self.table.cellWidget(r, 5)
+                if container:
+                    btn = container.findChild(QPushButton)
+                    if btn and btn.text() == "Обновить":
+                        item = self.table.item(r, 0)
+                        original_filename = item.data(Qt.ItemDataRole.UserRole) if item else None
+                        if original_filename:
+                            mods_to_backup.append(original_filename)
+
+            if mods_to_backup:
+                backup_dir = QFileDialog.getExistingDirectory(self, "Выберите папку для резервных копий")
+                if not backup_dir:
+                    return
+
+                copied = 0
+                missing = 0
+                for filename in mods_to_backup:
+                    src = os.path.join(self.mods_folder, filename)
+                    if os.path.exists(src):
+                        shutil.copy2(src, os.path.join(backup_dir, filename))
+                        copied += 1
+                    else:
+                        missing += 1
+
+                QMessageBox.information(
+                    self,
+                    "Резервное копирование",
+                    f"Скопировано файлов: {copied}\nОтсутствовало файлов: {missing}"
+                )
+
         for r in range(self.table.rowCount()):
             container = self.table.cellWidget(r, 5)
             if container:
@@ -735,13 +780,14 @@ class ModManagerApp(QWidget):
                 copied += 1
 
                 QMessageBox.information(
-                self,
-                "Резервное копирование",
-                f"Скопировано файлов: {copied}"
+                    self,
+                    "Резервное копирование",
+                    f"Скопировано файлов: {copied}"
                 )
 
-        def _set_track_updated_mods(self, enabled):
-            self.track_updated_mods = enabled
+    def _set_track_updated_mods(self, enabled):
+        self.track_updated_mods = enabled
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
