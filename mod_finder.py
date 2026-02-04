@@ -23,6 +23,7 @@ def resource_path(relative_path):
     """ Функция для поиска иконки внутри собранного EXE """
     try:
         base_path = sys._MEIPASS
+
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
@@ -331,15 +332,21 @@ class AppUpdateWorker(QThread):
     def run(self):
         repo_url = "https://api.github.com/repos/1FaY1/ModManager/releases/latest"
         try:
-            response = requests.get(repo_url, timeout=5)
+            response = requests.get(repo_url, timeout=10, headers=HEADERS)
             if response.status_code == 200:
                 data = response.json()
-                remote_version = data.get("tag_name", "").lstrip("v")
+                remote_tag = data.get("tag_name", "")
+                remote_version = remote_tag.lower().replace("v", "").strip()
+                current_version = VERSION.lower().replace("v", "").strip()
 
-                if remote_version and is_version_newer(remote_version, VERSION):
+                print(f"DEBUG: Local: {current_version}, Remote: {remote_version}")
+
+                if is_version_newer(remote_version, current_version):
                     self.update_found.emit(remote_version)
+            else:
+                print(f"DEBUG: GitHub API returned status {response.status_code}")
         except Exception as e:
-            print(f"Update check failed: {e}")
+            print(f"Update check error: {e}")
 
 
 class ModManagerApp(QWidget):
@@ -493,7 +500,6 @@ class ModManagerApp(QWidget):
         layout.addLayout(bottom)
 
     def select_custom_backup_folder(self):
-        """Выбор кастомной папки для бэкапов (в меню кнопки Обновить всё)"""
         f = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения бэкапов")
         if f:
             self.backup_folder = f
