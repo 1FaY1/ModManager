@@ -329,22 +329,22 @@ class ModManagerApp(QWidget):
     def check_for_app_updates(self):
         repo_url = "https://api.github.com/repos/1FaY1/ModManager/releases/latest"
         try:
-            response = requests.get(repo_url, timeout=5)
+            response = requests.get(repo_url, timeout=3)
             if response.status_code == 200:
                 data = response.json()
-                latest_version = data.get("tag_name", "").replace("v", "")
+                remote_version = data.get("tag_name", "").lstrip("v")
 
-                if latest_version and is_version_newer(latest_version, VERSION):
+                if remote_version and is_version_newer(remote_version, VERSION):
                     reply = QMessageBox.question(
                         self, "Обновление доступно",
-                        f"Доступна новая версия v{latest_version}!\n"
+                        f"Доступна новая версия v{remote_version}!\n"
                         f"У вас установлена v{VERSION}.\n\n"
                         "Хотите перейти на страницу скачивания?",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                     )
                     if reply == QMessageBox.StandardButton.Yes:
                         import webbrowser
-                        webbrowser.open(data.get("html_url"))
+                        webbrowser.open("https://github.com/1FaY1/ModManager/releases")
         except Exception as e:
             print(f"Ошибка проверки обновлений программы: {e}")
 
@@ -773,17 +773,30 @@ class ModManagerApp(QWidget):
             return
 
         copied = 0
+        errors = []
+
         for filename in sorted(self.updated_mods):
             src = os.path.join(self.mods_folder, filename)
-            if os.path.exists(src):
-                shutil.copy2(src, os.path.join(backup_dir, filename))
-                copied += 1
+            dst = os.path.join(backup_dir, filename)
 
-                QMessageBox.information(
-                    self,
-                    "Резервное копирование",
-                    f"Скопировано файлов: {copied}"
-                )
+            if os.path.exists(src):
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except Exception as e:
+                    print(f"Ошибка копирования {filename}: {e}")
+                    errors.append(filename)
+
+        msg = f"Успешно скопировано файлов: {copied}"
+        if errors:
+            msg += f"\n\nНе удалось скопировать ({len(errors)}):"
+            msg += "\n" + "\n".join(errors[:5])
+            if len(errors) > 5:
+                msg += "\n... и другие."
+
+            QMessageBox.warning(self, "Результат копирования", msg)
+        else:
+            QMessageBox.information(self, "Резервное копирование", msg)
 
     def _set_track_updated_mods(self, enabled):
         self.track_updated_mods = enabled
