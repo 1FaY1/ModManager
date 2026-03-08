@@ -92,7 +92,6 @@ class ModSearchWorker(QThread):
     def __init__(self, query, loader, mc_ver):
         super().__init__()
         self.query, self.loader, self.mc_ver = query.strip(), loader, mc_ver
-        self.updated_mods = []
 
     def run(self):
         try:
@@ -174,7 +173,7 @@ class ModSearchWorker(QThread):
                                 "needs_update": False
                             }
                 except Exception as e:
-                    print(f"Ошибка получения версии: {e}")
+                    logging.error("Ошибка получения версии: %s", e)
                 return None
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
@@ -187,7 +186,7 @@ class ModSearchWorker(QThread):
             self.results_ready.emit(results, True)
 
         except Exception as e:
-            print(f"Search error: {e}")
+            logging.error("Search error: %s", e)
             self.results_ready.emit([], False)
 
 
@@ -288,14 +287,14 @@ class AppUpdateWorker(QThread):
                 remote_version = remote_tag.lower().replace("v", "").strip()
                 current_version = VERSION.lower().replace("v", "").strip()
 
-                print(f"DEBUG: Local: {current_version}, Remote: {remote_version}")
+                logging.info("Update check: local=%s, remote=%s", current_version, remote_version)
 
                 if is_version_newer(remote_version, current_version):
                     self.update_found.emit(remote_version)
             else:
-                print(f"DEBUG: GitHub API returned status {response.status_code}")
+                logging.warning("GitHub API returned status %s", response.status_code)
         except Exception as e:
-            print(f"Update check error: {e}")
+            logging.error("Update check error: %s", e)
 
 
 class ApiDataWorker(QThread):
@@ -339,7 +338,7 @@ class ModManagerApp(QWidget):
                     "backup_folder": self.backup_folder
                 }, conf)
         except Exception as e:
-            print(f"Ошибка сохранения конфига: {e}")
+            logging.error("Ошибка сохранения конфига: %s", e)
 
     def __init__(self):
         super().__init__()
@@ -552,9 +551,9 @@ class ModManagerApp(QWidget):
 
         items = [
             (0, res["title"]),
-            (1, res["author"]),
-            (2, res["version"]),
-            (3, res["status"])
+            (1, res.get("author", "—")),
+            (2, res.get("version", "—")),
+            (3, res.get("status", "Неизвестно"))
         ]
 
         for col, text in items:
@@ -563,14 +562,14 @@ class ModManagerApp(QWidget):
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             if col == 0:
-                real_filename = res.get("display_name", res["title"])
+                real_filename = res.get("filename") or res.get("display_name") or res["title"]
                 item.setData(Qt.ItemDataRole.UserRole, real_filename)
 
             if col == 3:
                 if res.get("needs_update"):
                     item.setForeground(QColor("#e67e22"))
                     self.update_all_btn.show()
-                elif "Актуально" in res["status"] or "Загружен" in res["status"]:
+                elif "Актуально" in res.get("status", "") or "Загружен" in res.get("status", ""):
                     item.setForeground(QColor("#27ae60"))
 
             self.table.setItem(row, col, item)
@@ -607,6 +606,8 @@ class ModManagerApp(QWidget):
         self.table.scrollToBottom()
 
     def update_all_mods(self):
+        update_rows = self._collect_update_rows()
+
         if self.backup_before_update_action.isChecked():
             if not self.mods_folder:
                 QMessageBox.warning(self, "Ошибка", "Не выбрана рабочая папка.")
@@ -615,18 +616,7 @@ class ModManagerApp(QWidget):
             target_backup_dir = self.backup_folder or os.path.join(self.mods_folder, "backups")
             os.makedirs(target_backup_dir, exist_ok=True)
 
-            mods_to_backup = []
-            for r in range(self.table.rowCount()):
-                container = self.table.cellWidget(r, 5)
-                if container:
-                    btn: QPushButton = container.findChild(QPushButton)
-                    if btn and btn.text() == "Обновить":
-                        item = self.table.item(r, 0)
-                        if item:
-                            filename = item.data(Qt.ItemDataRole.UserRole)
-                            if filename:
-                                mods_to_backup.append(filename)
-
+            mods_to_backup = [filename for _, _, filename in update_rows if filename]
             for filename in mods_to_backup:
                 src = os.path.join(self.mods_folder, filename)
                 if os.path.exists(src):
@@ -635,16 +625,29 @@ class ModManagerApp(QWidget):
                     except Exception as e:
                         logging.error(f"Ошибка бэкапа {filename}: {e}")
 
-        for r in range(self.table.rowCount()):
-            container = self.table.cellWidget(r, 5)
-            if container:
-                btn: QPushButton = container.findChild(QPushButton)
-                if btn and btn.text() == "Обновить":
-                    btn.click()
+        for _, btn, _ in update_rows:
+            btn.click()
+
+    def _get_action_button(self, row):
+        container = self.table.cellWidget(row, 5)
+        if not container:
+            return None
+        return container.findChild(QPushButton)
+
+    def _collect_update_rows(self):
+        updates = []
+        for row in range(self.table.rowCount()):
+            btn = self._get_action_button(row)
+            if not btn or btn.text() != "Обновить":
+                continue
+
+            item = self.table.item(row, 0)
+            filename = item.data(Qt.ItemDataRole.UserRole) if item else None
+            updates.append((row, btn, filename))
+        return updates
 
     def download(self, row, url, filename, needs_update):
-        container_btn = self.table.cellWidget(row, 5)
-        btn: QPushButton = container_btn.findChild(QPushButton)
+        btn = self._get_action_button(row)
         if not btn:
             return
 
@@ -667,7 +670,7 @@ class ModManagerApp(QWidget):
                     existing_path = os.path.join(save_dir, existing_file)
                     file_hash = get_file_hash(existing_path)
                     if file_hash:
-                        hash_to_file[file_hash] = existing_file
+                        hash_to_file.setdefault(file_hash, []).append(existing_file)
 
                 recognized_processed = False
                 if hash_to_file:
@@ -681,11 +684,13 @@ class ModManagerApp(QWidget):
                         recognized = r.json()
                         for file_hash, data in recognized.items():
                             if data.get("project_id") == project_id:
-                                old_file = hash_to_file.get(file_hash)
-                                if old_file and old_file != filename:
+                                old_files = hash_to_file.get(file_hash, [])
+                                for old_file in old_files:
+                                    if old_file == filename:
+                                        continue
                                     old_path = os.path.join(save_dir, old_file)
                                     os.remove(old_path)
-                                    print(f"Удалена старая версия мода по ID: {old_file}")
+                                    logging.info("Удалена старая версия мода по hash/ID: %s", old_file)
                         recognized_processed = True
 
                 if not recognized_processed:
@@ -704,9 +709,9 @@ class ModManagerApp(QWidget):
                             if existing_file in valid_filenames and existing_file != filename:
                                 old_path = os.path.join(save_dir, existing_file)
                                 os.remove(old_path)
-                                print(f"Удалена старая версия мода по ID: {existing_file}")
+                                logging.info("Удалена старая версия мода по имени: %s", existing_file)
             except Exception as e:
-                print(f"Ошибка точной очистки: {e}")
+                logging.error("Ошибка точной очистки: %s", e)
 
         dest = os.path.join(save_dir, filename)
         container = self.table.cellWidget(row, 4)
@@ -719,7 +724,7 @@ class ModManagerApp(QWidget):
         def cleanup():
             if downloader in self.active_downloads:
                 self.active_downloads.remove(downloader)
-                print(f"Поток для {filename} очищен из памяти.")
+                logging.info("Поток для %s очищен из памяти.", filename)
 
         def on_done(path):
             btn.setText("Ок")
@@ -727,7 +732,7 @@ class ModManagerApp(QWidget):
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filename)
             self.status_lbl.setText(f"Скачано: {filename}")
 
-            if filename not in self.updated_mods:
+            if os.path.exists(path) and filename not in self.updated_mods:
                 self.updated_mods.append(filename)
 
             cleanup()
@@ -768,7 +773,7 @@ class ModManagerApp(QWidget):
                     shutil.copy2(src, dst)
                     copied += 1
                 except Exception as e:
-                    print(f"Ошибка копирования {filename}: {e}")
+                    logging.error("Ошибка копирования %s: %s", filename, e)
                     errors.append(f"{filename} ({str(e)})")
 
         msg = f"Успешно скопировано файлов: {copied}"
