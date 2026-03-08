@@ -1,4 +1,4 @@
-# 🛠 Mod Manager Pro v1.5
+# 🛠 Mod Manager Pro v1.6
 Легкая, быстрая и прозрачная утилита для управления модами Minecraft через **Modrinth API**.
 ---
 ## ⚙ Основные возможности
