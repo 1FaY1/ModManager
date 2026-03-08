@@ -162,13 +162,18 @@ class ModSearchWorker(QThread):
                             if not selected_v:
                                 selected_v = versions[0]
 
+                            files = selected_v.get("files") or []
+                            if not files:
+                                return None
+                            primary_file = files[0]
+
                             return {
                                 "title": hit["title"],
                                 "author": hit["author"],
                                 "version": selected_v["version_number"],
                                 "project_id": hit["project_id"],
-                                "url": selected_v["files"][0]["url"],
-                                "filename": selected_v["files"][0]["filename"],
+                                "url": primary_file.get("url", ""),
+                                "filename": primary_file.get("filename", ""),
                                 "status": "Доступен",
                                 "needs_update": False
                             }
@@ -212,7 +217,7 @@ class FolderScannerWorker(QThread):
             path = os.path.join(self.folder, f)
             f_hash = get_file_hash(path)
             if f_hash:
-                hash_to_file[f_hash] = f
+                hash_to_file.setdefault(f_hash, []).append(f)
 
         if not hash_to_file:
             self.finished.emit()
@@ -227,17 +232,109 @@ class FolderScannerWorker(QThread):
             )
             if r.status_code == 200:
                 recognized = r.json()
-                for f_hash, v_data in recognized.items():
-                    mod_info = {
-                        "title": v_data.get('project_id', hash_to_file[f_hash]),
-                        "version": v_data['version_number'],
-                        "status": "Загружен",
-                        "project_id": v_data['project_id'],
-                        "filename": hash_to_file[f_hash],
-                        "needs_update": False
+                projects_cache = {}
+
+                def get_project_title(project_id):
+                    if project_id in projects_cache:
+                        return projects_cache[project_id]
+                    try:
+                        p_res = requests.get(
+                            f"{MODRINTH_API}/project/{project_id}",
+                            headers=HEADERS,
+                            timeout=8
+                        )
+                        if p_res.status_code == 200:
+                            title = p_res.json().get("title") or project_id
+                        else:
+                            title = project_id
+                    except Exception:
+                        title = project_id
+                    projects_cache[project_id] = title
+                    return title
+
+                def find_latest_release(project_id):
+                    params = {
+                        "loaders": json.dumps([self.loader]),
+                        "game_versions": json.dumps([self.mc_ver])
                     }
-                    # Тут можно добавить логику проверки обновлений, если self.check_updates == True
-                    self.mod_found.emit(mod_info)
+                    vr = requests.get(
+                        f"{MODRINTH_API}/project/{project_id}/version",
+                        params=params,
+                        headers=HEADERS,
+                        timeout=10
+                    )
+                    vr.raise_for_status()
+                    versions = vr.json()
+                    if not versions:
+                        return None
+
+                    selected = None
+                    for v in versions:
+                        if v.get("version_type") == "release":
+                            selected = v
+                            break
+                    if not selected:
+                        for v in versions:
+                            if v.get("version_type") == "beta":
+                                selected = v
+                                break
+                    if not selected:
+                        selected = versions[0]
+
+                    version_files = selected.get("files") or []
+                    if not version_files:
+                        return None
+                    return {
+                        "version": selected.get("version_number", "—"),
+                        "url": version_files[0].get("url"),
+                        "filename": version_files[0].get("filename")
+                    }
+
+                for f_hash, v_data in recognized.items():
+                    project_id = v_data.get('project_id')
+                    current_version = v_data.get('version_number', '—')
+                    matched_files = hash_to_file.get(f_hash, [])
+                    latest_data = None
+
+                    if self.check_updates and project_id:
+                        try:
+                            latest_data = find_latest_release(project_id)
+                        except Exception as e:
+                            logging.error("Ошибка получения последней версии %s: %s", project_id, e)
+
+                    for filename in matched_files:
+                        needs_update = False
+                        status = "Загружен"
+                        out_version = current_version
+                        out_url = None
+                        out_filename = filename
+
+                        if self.check_updates:
+                            if latest_data and latest_data.get("version"):
+                                out_version = latest_data["version"]
+                                out_url = latest_data.get("url")
+                                out_filename = latest_data.get("filename") or filename
+                                if latest_data["version"] != current_version:
+                                    needs_update = True
+                                    status = "Требуется обновление"
+                                else:
+                                    status = "Актуально"
+                            else:
+                                status = "Не удалось проверить"
+
+                        title = get_project_title(project_id) if project_id else filename
+
+                        mod_info = {
+                            "title": title,
+                            "version": out_version,
+                            "status": status,
+                            "project_id": project_id,
+                            "filename": out_filename,
+                            "display_name": filename,
+                            "url": out_url,
+                            "needs_update": needs_update
+                        }
+                        self.mod_found.emit(mod_info)
         except Exception as e:
             logging.error(f"Ошибка сканирования: {e}")
 
@@ -304,10 +401,14 @@ class ApiDataWorker(QThread):
 
     def run(self):
         try:
-            v_res = requests.get(f"{MODRINTH_API}/tag/game_version", timeout=10).json()
+            v_resp = requests.get(f"{MODRINTH_API}/tag/game_version", timeout=10)
+            v_resp.raise_for_status()
+            v_res = v_resp.json()
             versions = [v['version'] for v in v_res if v.get('version_type') == 'release']
 
-            l_res = requests.get(f"{MODRINTH_API}/tag/loader", timeout=10).json()
+            l_resp = requests.get(f"{MODRINTH_API}/tag/loader", timeout=10)
+            l_resp.raise_for_status()
+            l_res = l_resp.json()
             loaders = sorted([l['name'].capitalize() for l in l_res
                               if "mod" in l.get("supported_project_types", [])])
 
@@ -562,7 +663,7 @@ class ModManagerApp(QWidget):
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             if col == 0:
-                real_filename = res.get("filename") or res.get("display_name") or res["title"]
+                real_filename = res.get("display_name") or res.get("filename") or res["title"]
                 item.setData(Qt.ItemDataRole.UserRole, real_filename)
 
             if col == 3:
@@ -659,6 +760,8 @@ class ModManagerApp(QWidget):
             QMessageBox.warning(self, "!", "Выберите папку!")
             return
 
+        files_to_delete_after_download = []
+
         if project_id and is_update and needs_update:
             try:
                 candidate_files = [
@@ -688,9 +791,7 @@ class ModManagerApp(QWidget):
                                 for old_file in old_files:
                                     if old_file == filename:
                                         continue
-                                    old_path = os.path.join(save_dir, old_file)
-                                    os.remove(old_path)
-                                    logging.info("Удалена старая версия мода по hash/ID: %s", old_file)
+                                    files_to_delete_after_download.append(old_file)
                         recognized_processed = True
 
                 if not recognized_processed:
@@ -700,18 +801,26 @@ class ModManagerApp(QWidget):
                         timeout=5
                     )
                     if v_res.status_code == 200:
-                        valid_filenames = []
+                        valid_filenames = set()
                         for ver in v_res.json():
-                            for f in ver['files']:
-                                valid_filenames.append(f['filename'])
+                            for file_entry in ver.get('files', []):
+                                fname = file_entry.get('filename')
+                                if fname:
+                                    valid_filenames.add(fname)
 
-                        for existing_file in os.listdir(save_dir):
-                            if existing_file in valid_filenames and existing_file != filename:
-                                old_path = os.path.join(save_dir, existing_file)
-                                os.remove(old_path)
-                                logging.info("Удалена старая версия мода по имени: %s", existing_file)
+                        if valid_filenames:
+                            for existing_file in os.listdir(save_dir):
+                                if existing_file == filename:
+                                    continue
+                                existing_path = os.path.join(save_dir, existing_file)
+                                if not os.path.isfile(existing_path):
+                                    continue
+                                if existing_file in valid_filenames:
+                                    files_to_delete_after_download.append(existing_file)
             except Exception as e:
                 logging.error("Ошибка точной очистки: %s", e)
+
+        files_to_delete_after_download = sorted(set(files_to_delete_after_download))
 
         dest = os.path.join(save_dir, filename)
         container = self.table.cellWidget(row, 4)
@@ -731,6 +840,16 @@ class ModManagerApp(QWidget):
             self.table.item(row, 0).setText(filename)
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filename)
             self.status_lbl.setText(f"Скачано: {filename}")
+
+            if os.path.exists(path):
+                for old_file in files_to_delete_after_download:
+                    old_path = os.path.join(save_dir, old_file)
+                    if os.path.exists(old_path):
+                        try:
+                            os.remove(old_path)
+                            logging.info("Удалена старая версия мода после загрузки: %s", old_file)
+                        except Exception as e:
+                            logging.error("Не удалось удалить %s: %s", old_file, e)
 
             if os.path.exists(path) and filename not in self.updated_mods:
                 self.updated_mods.append(filename)
