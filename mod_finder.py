@@ -6,6 +6,8 @@ import concurrent.futures
 import re
 import shutil
 import logging
+import time
+import random
 from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -40,6 +42,8 @@ MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
 CONFIG_FILE = "mod_manager_config.json"
+MAX_RETRIES = 3
+RETRYABLE_STATUS_CODES = {429, 503}
 
 _VERSION_RE = re.compile(r"(\d+|[a-zA-Z]+)")
 
@@ -60,6 +64,26 @@ def is_version_newer(latest_version, current_version):
     return _version_key(latest_version) > _version_key(current_version)
 
 
+def request_with_retry(session, method, url, *, max_retries=MAX_RETRIES, retry_statuses=None, **kwargs):
+    retry_statuses = retry_statuses or RETRYABLE_STATUS_CODES
+    last_response = None
+
+    for attempt in range(max_retries):
+        response = session.request(method, url, **kwargs)
+        last_response = response
+        if response.status_code not in retry_statuses:
+            return response
+
+        retry_after = response.headers.get("Retry-After")
+        if retry_after and retry_after.isdigit():
+            sleep_s = min(float(retry_after), 5.0)
+        else:
+            sleep_s = (0.4 * (2 ** attempt)) + random.uniform(0, 0.2)
+        time.sleep(sleep_s)
+
+    return last_response
+
+
 class DownloadThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
@@ -68,10 +92,18 @@ class DownloadThread(QThread):
     def __init__(self, url, save_path):
         super().__init__()
         self.url, self.save_path = url, save_path
+        self.session = requests.Session()
 
     def run(self):
         try:
-            with requests.get(self.url, stream=True, headers=HEADERS, timeout=20) as r:
+            with request_with_retry(
+                self.session,
+                "GET",
+                self.url,
+                stream=True,
+                headers=HEADERS,
+                timeout=20
+            ) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
                 downloaded = 0
@@ -92,6 +124,7 @@ class ModSearchWorker(QThread):
     def __init__(self, query, loader, mc_ver):
         super().__init__()
         self.query, self.loader, self.mc_ver = query.strip(), loader, mc_ver
+        self.session = requests.Session()
 
     def run(self):
         try:
@@ -111,7 +144,14 @@ class ModSearchWorker(QThread):
                 "facets": f"[{','.join(facets)}]"
             }
 
-            r = requests.get(f"{MODRINTH_API}/search", params=params, headers=HEADERS, timeout=10)
+            r = request_with_retry(
+                self.session,
+                "GET",
+                f"{MODRINTH_API}/search",
+                params=params,
+                headers=HEADERS,
+                timeout=10
+            )
             r.raise_for_status()
             hits = r.json().get("hits", [])
 
@@ -137,7 +177,9 @@ class ModSearchWorker(QThread):
                 }
 
                 try:
-                    vr = requests.get(
+                    vr = request_with_retry(
+                        self.session,
+                        "GET",
                         f"{MODRINTH_API}/project/{hit['project_id']}/version",
                         params=v_params,
                         headers=HEADERS,
@@ -205,6 +247,7 @@ class FolderScannerWorker(QThread):
         self.loader = loader.lower()
         self.mc_ver = mc_ver
         self.check_updates = check_updates
+        self.session = requests.Session()
 
     def run(self):
         if not os.path.exists(self.folder):
@@ -225,7 +268,9 @@ class FolderScannerWorker(QThread):
 
         try:
             # Массовый запрос по хешам
-            r = requests.post(
+            r = request_with_retry(
+                self.session,
+                "POST",
                 f"{MODRINTH_API}/version_files",
                 json={"hashes": list(hash_to_file.keys()), "algorithm": "sha1"},
                 headers=HEADERS, timeout=15
@@ -235,7 +280,9 @@ class FolderScannerWorker(QThread):
 
                 def get_project_title(project_id):
                     try:
-                        p_res = requests.get(
+                        p_res = request_with_retry(
+                            self.session,
+                            "GET",
                             f"{MODRINTH_API}/project/{project_id}",
                             headers=HEADERS,
                             timeout=8
@@ -251,7 +298,9 @@ class FolderScannerWorker(QThread):
                         "loaders": json.dumps([self.loader]),
                         "game_versions": json.dumps([self.mc_ver])
                     }
-                    vr = requests.get(
+                    vr = request_with_retry(
+                        self.session,
+                        "GET",
                         f"{MODRINTH_API}/project/{project_id}/version",
                         params=params,
                         headers=HEADERS,
@@ -391,10 +440,14 @@ class FolderSelectDialog(QDialog):
 class AppUpdateWorker(QThread):
     update_found = pyqtSignal(str)
 
+    def __init__(self):
+        super().__init__()
+        self.session = requests.Session()
+
     def run(self):
         repo_url = "https://api.github.com/repos/1FaY1/ModManager/releases/latest"
         try:
-            response = requests.get(repo_url, timeout=10, headers=HEADERS)
+            response = request_with_retry(self.session, "GET", repo_url, timeout=10, headers=HEADERS)
             if response.status_code == 200:
                 data = response.json()
                 remote_tag = data.get("tag_name", "")
@@ -416,14 +469,18 @@ class ApiDataWorker(QThread):
     data_loaded = pyqtSignal(list, list)
     error_occurred = pyqtSignal(str)
 
+    def __init__(self):
+        super().__init__()
+        self.session = requests.Session()
+
     def run(self):
         try:
-            v_resp = requests.get(f"{MODRINTH_API}/tag/game_version", timeout=10)
+            v_resp = request_with_retry(self.session, "GET", f"{MODRINTH_API}/tag/game_version", timeout=10)
             v_resp.raise_for_status()
             v_res = v_resp.json()
             versions = [v['version'] for v in v_res if v.get('version_type') == 'release']
 
-            l_resp = requests.get(f"{MODRINTH_API}/tag/loader", timeout=10)
+            l_resp = request_with_retry(self.session, "GET", f"{MODRINTH_API}/tag/loader", timeout=10)
             l_resp.raise_for_status()
             l_res = l_resp.json()
             loaders = sorted([l['name'].capitalize() for l in l_res
@@ -467,6 +524,7 @@ class ModManagerApp(QWidget):
         self.setWindowIcon(QIcon(icon_path))
 
         self.resize(1100, 650)
+        self.http_session = requests.Session()
         self.mods_folder, self.download_folder, self.backup_folder = "", "", ""
         self.active_downloads = []
         self.updated_mods = []
@@ -486,6 +544,8 @@ class ModManagerApp(QWidget):
         self.update_worker.start()
 
     def _on_api_data_ready(self, versions, loaders):
+        self.version_box.clear()
+        self.loader_box.clear()
         self.version_box.addItems(versions)
         self.loader_box.addItems(loaders)
         self.status_lbl.setText("Готово к работе")
@@ -822,7 +882,9 @@ class ModManagerApp(QWidget):
 
                 recognized_processed = False
                 if hash_to_file:
-                    r = requests.post(
+                    r = request_with_retry(
+                        self.http_session,
+                        "POST",
                         f"{MODRINTH_API}/version_files",
                         json={"hashes": list(hash_to_file.keys()), "algorithm": "sha1"},
                         headers=HEADERS,
@@ -840,7 +902,9 @@ class ModManagerApp(QWidget):
                         recognized_processed = True
 
                 if not recognized_processed:
-                    v_res = requests.get(
+                    v_res = request_with_retry(
+                        self.http_session,
+                        "GET",
                         f"{MODRINTH_API}/project/{project_id}/version",
                         headers=HEADERS,
                         timeout=5
