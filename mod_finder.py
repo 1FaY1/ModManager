@@ -232,11 +232,8 @@ class FolderScannerWorker(QThread):
             )
             if r.status_code == 200:
                 recognized = r.json()
-                projects_cache = {}
 
                 def get_project_title(project_id):
-                    if project_id in projects_cache:
-                        return projects_cache[project_id]
                     try:
                         p_res = requests.get(
                             f"{MODRINTH_API}/project/{project_id}",
@@ -244,13 +241,10 @@ class FolderScannerWorker(QThread):
                             timeout=8
                         )
                         if p_res.status_code == 200:
-                            title = p_res.json().get("title") or project_id
-                        else:
-                            title = project_id
+                            return p_res.json().get("title") or project_id
                     except Exception:
-                        title = project_id
-                    projects_cache[project_id] = title
-                    return title
+                        pass
+                    return project_id
 
                 def find_latest_release(project_id):
                     params = {
@@ -290,17 +284,36 @@ class FolderScannerWorker(QThread):
                         "filename": version_files[0].get("filename")
                     }
 
+                project_ids = {
+                    data.get("project_id") for data in recognized.values() if data.get("project_id")
+                }
+                latest_map = {}
+                title_map = {}
+
+                if self.check_updates and project_ids:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
+                        latest_futures = {ex.submit(find_latest_release, pid): pid for pid in project_ids}
+                        for future in concurrent.futures.as_completed(latest_futures):
+                            pid = latest_futures[future]
+                            try:
+                                latest_map[pid] = future.result()
+                            except Exception as e:
+                                logging.error("Ошибка получения последней версии %s: %s", pid, e)
+                                latest_map[pid] = None
+
+                        title_futures = {ex.submit(get_project_title, pid): pid for pid in project_ids}
+                        for future in concurrent.futures.as_completed(title_futures):
+                            pid = title_futures[future]
+                            try:
+                                title_map[pid] = future.result()
+                            except Exception:
+                                title_map[pid] = pid
+
                 for f_hash, v_data in recognized.items():
                     project_id = v_data.get('project_id')
                     current_version = v_data.get('version_number', '—')
                     matched_files = hash_to_file.get(f_hash, [])
-                    latest_data = None
-
-                    if self.check_updates and project_id:
-                        try:
-                            latest_data = find_latest_release(project_id)
-                        except Exception as e:
-                            logging.error("Ошибка получения последней версии %s: %s", project_id, e)
+                    latest_data = latest_map.get(project_id) if project_id else None
 
                     for filename in matched_files:
                         needs_update = False
@@ -311,18 +324,22 @@ class FolderScannerWorker(QThread):
 
                         if self.check_updates:
                             if latest_data and latest_data.get("version"):
-                                out_version = latest_data["version"]
+                                latest_version = latest_data["version"]
+                                out_version = latest_version
                                 out_url = latest_data.get("url")
                                 out_filename = latest_data.get("filename") or filename
-                                if latest_data["version"] != current_version:
+                                if latest_version != current_version:
                                     needs_update = True
-                                    status = "Требуется обновление"
+                                    status = f"Обновление: {current_version} → {latest_version}"
                                 else:
                                     status = "Актуально"
                             else:
                                 status = "Не удалось проверить"
 
-                        title = get_project_title(project_id) if project_id else filename
+                        if self.check_updates and project_id:
+                            title = title_map.get(project_id, project_id)
+                        else:
+                            title = filename
 
                         mod_info = {
                             "title": title,
@@ -453,6 +470,8 @@ class ModManagerApp(QWidget):
         self.mods_folder, self.download_folder, self.backup_folder = "", "", ""
         self.active_downloads = []
         self.updated_mods = []
+        self.pending_batch_updates = 0
+        self.batch_total_updates = 0
 
         self._init_ui()
         self.load_settings()
@@ -557,7 +576,7 @@ class ModManagerApp(QWidget):
 
         self.backup_before_update_action = QAction("Резервное копирование перед обновлением", self)
         self.backup_before_update_action.setCheckable(True)
-        self.backup_before_update_action.setChecked(True)
+        self.backup_before_update_action.setChecked(False)
         # Подсказки
         self.backup_before_update_action.setStatusTip("Сохраняет старые версии файлов в папку 'backups' перед заменой")
         self.backup_before_update_action.setToolTip(
@@ -708,10 +727,22 @@ class ModManagerApp(QWidget):
 
     def update_all_mods(self):
         update_rows = self._collect_update_rows()
+        if not update_rows:
+            QMessageBox.information(self, "Обновление", "Нет модов, требующих обновления.")
+            return
+
+        self.batch_total_updates = len(update_rows)
+        self.pending_batch_updates = len(update_rows)
+        self.update_all_btn.setEnabled(False)
+        self.set_loading(True, f"Обновление модов 0/{self.batch_total_updates}")
 
         if self.backup_before_update_action.isChecked():
             if not self.mods_folder:
                 QMessageBox.warning(self, "Ошибка", "Не выбрана рабочая папка.")
+                self.pending_batch_updates = 0
+                self.batch_total_updates = 0
+                self.update_all_btn.setEnabled(True)
+                self.set_loading(False)
                 return
 
             target_backup_dir = self.backup_folder or os.path.join(self.mods_folder, "backups")
@@ -728,6 +759,20 @@ class ModManagerApp(QWidget):
 
         for _, btn, _ in update_rows:
             btn.click()
+
+    def _mark_batch_download_done(self, ok):
+        if self.pending_batch_updates <= 0:
+            return
+
+        self.pending_batch_updates -= 1
+        completed = self.batch_total_updates - self.pending_batch_updates
+        prefix = "✅" if ok else "⚠️"
+        self.status_lbl.setText(f"{prefix} Обновление модов: {completed}/{self.batch_total_updates}")
+
+        if self.pending_batch_updates == 0:
+            self.batch_total_updates = 0
+            self.update_all_btn.setEnabled(True)
+            self.set_loading(False)
 
     def _get_action_button(self, row):
         container = self.table.cellWidget(row, 5)
@@ -855,11 +900,13 @@ class ModManagerApp(QWidget):
                 self.updated_mods.append(filename)
 
             cleanup()
+            self._mark_batch_download_done(True)
 
         def on_error(err_msg):
             QMessageBox.critical(self, "Ошибка", err_msg)
             btn.setEnabled(True)
             cleanup()
+            self._mark_batch_download_done(False)
 
         downloader.finished.connect(on_done)
         downloader.error.connect(on_error)
