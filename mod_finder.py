@@ -8,6 +8,7 @@ import shutil
 import logging
 import time
 import random
+from collections import Counter, defaultdict
 from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -19,7 +20,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QAction
 
-from utils import get_file_hash
+from utils import get_file_hash, read_archive_metadata
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,13 +38,20 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-VERSION = "1.5"
+VERSION = "1.7"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
 CONFIG_FILE = "mod_manager_config.json"
 MAX_RETRIES = 3
 RETRYABLE_STATUS_CODES = {429, 503}
+ADAPTER_ID_MARKERS = {"connector", "sinytra_connector"}
+ADAPTER_NAME_MARKERS = ("sinytra", "connector")
+SCAN_TYPE_RULES = {
+    "Моды": {"subdir": "mods", "extensions": (".jar",), "project_type": "mod"},
+    "Шейдеры": {"subdir": "shaderpacks", "extensions": (".zip",), "project_type": "shader"},
+    "Текстур-паки": {"subdir": "resourcepacks", "extensions": (".zip",), "project_type": "resourcepack"},
+}
 
 _VERSION_RE = re.compile(r"(\d+|[a-zA-Z]+)")
 
@@ -62,6 +70,42 @@ def _version_key(raw_version):
 
 def is_version_newer(latest_version, current_version):
     return _version_key(latest_version) > _version_key(current_version)
+
+
+def discover_scan_targets(selected_path):
+    selected_path = os.path.abspath(selected_path)
+    targets = []
+    has_known_subdirs = False
+    for title, rule in SCAN_TYPE_RULES.items():
+        candidate = os.path.join(selected_path, rule["subdir"])
+        if os.path.isdir(candidate):
+            has_known_subdirs = True
+            targets.append({
+                "title": title,
+                "folder": candidate,
+                "extensions": rule["extensions"],
+                "project_type": rule["project_type"]
+            })
+
+    if has_known_subdirs:
+        return targets, selected_path
+
+    folder_name = os.path.basename(selected_path).lower()
+    for title, rule in SCAN_TYPE_RULES.items():
+        if folder_name == rule["subdir"]:
+            return [{
+                "title": title,
+                "folder": selected_path,
+                "extensions": rule["extensions"],
+                "project_type": rule["project_type"]
+            }], os.path.dirname(selected_path)
+
+    return [{
+        "title": "Моды",
+        "folder": selected_path,
+        "extensions": (".jar",),
+        "project_type": "mod"
+    }], os.path.dirname(selected_path)
 
 
 def request_with_retry(session, method, url, *, max_retries=MAX_RETRIES, retry_statuses=None, **kwargs):
@@ -130,12 +174,14 @@ class ModSearchWorker(QThread):
         try:
             clean_loader = self.loader.strip().lower()
             clean_ver = self.mc_ver.strip()
+            loader_filter = clean_loader if clean_loader and clean_loader != "авто" else ""
+            version_filter = clean_ver if clean_ver and clean_ver != "Авто" else ""
 
-            facets = [
-                '["project_type:mod"]',
-                f'["categories:{clean_loader}"]',
-                f'["versions:{clean_ver}"]'
-            ]
+            facets = ['["project_type:mod"]']
+            if loader_filter:
+                facets.append(f'["categories:{loader_filter}"]')
+            if version_filter:
+                facets.append(f'["versions:{version_filter}"]')
 
             params = {
                 "query": f'"{self.query}"',
@@ -171,10 +217,11 @@ class ModSearchWorker(QThread):
             results = []
 
             def fetch_ver(hit):
-                v_params = {
-                    "loaders": f'["{clean_loader}"]',
-                    "game_versions": f'["{clean_ver}"]'
-                }
+                v_params = {}
+                if loader_filter:
+                    v_params["loaders"] = f'["{loader_filter}"]'
+                if version_filter:
+                    v_params["game_versions"] = f'["{version_filter}"]'
 
                 try:
                     vr = request_with_retry(
@@ -241,38 +288,65 @@ class FolderScannerWorker(QThread):
     mod_found = pyqtSignal(dict)
     finished = pyqtSignal()
 
-    def __init__(self, folder, loader, mc_ver, check_updates=False):
+    def __init__(self, targets, loader, mc_ver, check_updates=False):
         super().__init__()
-        self.folder = folder
+        self.targets = targets
         self.loader = loader.lower()
         self.mc_ver = mc_ver
         self.check_updates = check_updates
         self.session = requests.Session()
 
     def run(self):
-        if not os.path.exists(self.folder):
+        if not self.targets:
             self.finished.emit()
             return
 
-        files = [f for f in os.listdir(self.folder) if f.endswith('.jar')]
-        hash_to_file = {}
-        for f in files:
-            path = os.path.join(self.folder, f)
-            f_hash = get_file_hash(path)
-            if f_hash:
-                hash_to_file.setdefault(f_hash, []).append(f)
+        hash_to_entries = {}
+        adapter_present = False
+        detected_versions = set()
+        detected_loaders = set()
+        loader_counter = Counter()
+        version_counter = Counter()
 
-        if not hash_to_file:
+        for target in self.targets:
+            folder = target["folder"]
+            if not os.path.exists(folder):
+                continue
+            extensions = tuple(ext.lower() for ext in target["extensions"])
+            for f in os.listdir(folder):
+                if not f.lower().endswith(extensions):
+                    continue
+                path = os.path.join(folder, f)
+                if not os.path.isfile(path):
+                    continue
+                f_hash = get_file_hash(path)
+                if not f_hash:
+                    continue
+                entry = {"filename": f, "folder": folder, "target": target}
+                hash_to_entries.setdefault(f_hash, []).append(entry)
+                if f.lower().endswith(".jar"):
+                    archive_meta = read_archive_metadata(path)
+                    detected_versions.update(archive_meta.get("mc_versions", set()))
+                    detected_loaders.update(archive_meta.get("loaders", set()))
+                    loader_counter.update(archive_meta.get("loaders", set()))
+                    version_counter.update(archive_meta.get("mc_versions", set()))
+                    mod_ids = archive_meta.get("mod_ids", set())
+                    if mod_ids.intersection(ADAPTER_ID_MARKERS):
+                        adapter_present = True
+                    lower_name = f.lower()
+                    if all(marker in lower_name for marker in ADAPTER_NAME_MARKERS):
+                        adapter_present = True
+
+        if not hash_to_entries:
             self.finished.emit()
             return
 
         try:
-            # Массовый запрос по хешам
             r = request_with_retry(
                 self.session,
                 "POST",
                 f"{MODRINTH_API}/version_files",
-                json={"hashes": list(hash_to_file.keys()), "algorithm": "sha1"},
+                json={"hashes": list(hash_to_entries.keys()), "algorithm": "sha1"},
                 headers=HEADERS, timeout=15
             )
             if r.status_code == 200:
@@ -293,36 +367,89 @@ class FolderScannerWorker(QThread):
                         pass
                     return project_id
 
-                def find_latest_release(project_id):
-                    params = {
-                        "loaders": json.dumps([self.loader]),
-                        "game_versions": json.dumps([self.mc_ver])
-                    }
+                project_loader_hints = defaultdict(set)
+                project_version_hints = defaultdict(set)
+                for data in recognized.values():
+                    pid = data.get("project_id")
+                    if not pid:
+                        continue
+                    for loader_name in data.get("loaders", []) or []:
+                        project_loader_hints[pid].add(loader_name)
+                    for game_ver in data.get("game_versions", []) or []:
+                        project_version_hints[pid].add(game_ver)
+
+                def find_latest_release(project_id, project_type):
+                    params = {}
+                    if project_type == "mod":
+                        primary_loader = loader_counter.most_common(1)[0][0] if loader_counter else None
+                        primary_version = version_counter.most_common(1)[0][0] if version_counter else None
+                        hint_loaders = project_loader_hints.get(project_id, set())
+                        hint_versions = project_version_hints.get(project_id, set())
+
+                        loaders_for_query = set()
+                        if self.loader != "авто":
+                            loaders_for_query.add(self.loader)
+                        else:
+                            if hint_loaders:
+                                loaders_for_query.update(hint_loaders)
+                            elif primary_loader:
+                                loaders_for_query.add(primary_loader)
+                            else:
+                                loaders_for_query.update(detected_loaders)
+                        if adapter_present:
+                            loaders_for_query.update({"fabric", "forge"})
+                        loaders_for_query = {ldr for ldr in loaders_for_query if ldr}
+                        if loaders_for_query:
+                            params["loaders"] = json.dumps(sorted(loaders_for_query))
+
+                        versions_for_query = set()
+                        if self.mc_ver != "Авто":
+                            versions_for_query.add(self.mc_ver)
+                        else:
+                            if hint_versions:
+                                versions_for_query.update(hint_versions)
+                            elif primary_version:
+                                versions_for_query.add(primary_version)
+                            else:
+                                versions_for_query.update(detected_versions)
+                        if versions_for_query:
+                            params["game_versions"] = json.dumps(sorted(versions_for_query))
+
                     vr = request_with_retry(
                         self.session,
                         "GET",
                         f"{MODRINTH_API}/project/{project_id}/version",
-                        params=params,
+                        params=params if params else None,
                         headers=HEADERS,
                         timeout=10
                     )
                     vr.raise_for_status()
                     versions = vr.json()
+                    if not versions and params:
+                        vr = request_with_retry(
+                            self.session,
+                            "GET",
+                            f"{MODRINTH_API}/project/{project_id}/version",
+                            headers=HEADERS,
+                            timeout=10
+                        )
+                        vr.raise_for_status()
+                        versions = vr.json()
                     if not versions:
                         return None
 
-                    selected = None
-                    for v in versions:
-                        if v.get("version_type") == "release":
-                            selected = v
-                            break
-                    if not selected:
-                        for v in versions:
-                            if v.get("version_type") == "beta":
-                                selected = v
-                                break
-                    if not selected:
-                        selected = versions[0]
+                    def pick_best_version(candidates):
+                        if not candidates:
+                            return None
+                        return max(candidates, key=lambda item: item.get("date_published") or "")
+
+                    release_versions = [v for v in versions if v.get("version_type") == "release"]
+                    beta_versions = [v for v in versions if v.get("version_type") == "beta"]
+                    selected = (
+                        pick_best_version(release_versions)
+                        or pick_best_version(beta_versions)
+                        or pick_best_version(versions)
+                    )
 
                     version_files = selected.get("files") or []
                     if not version_files:
@@ -336,12 +463,21 @@ class FolderScannerWorker(QThread):
                 project_ids = {
                     data.get("project_id") for data in recognized.values() if data.get("project_id")
                 }
+                project_type_map = {}
+                for data in recognized.values():
+                    pid = data.get("project_id")
+                    ptype = data.get("project_type")
+                    if pid and ptype:
+                        project_type_map[pid] = ptype
                 latest_map = {}
                 title_map = {}
 
                 if self.check_updates and project_ids:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
-                        latest_futures = {ex.submit(find_latest_release, pid): pid for pid in project_ids}
+                        latest_futures = {
+                            ex.submit(find_latest_release, pid, project_type_map.get(pid, "mod")): pid
+                            for pid in project_ids
+                        }
                         for future in concurrent.futures.as_completed(latest_futures):
                             pid = latest_futures[future]
                             try:
@@ -359,12 +495,15 @@ class FolderScannerWorker(QThread):
                                 title_map[pid] = pid
 
                 for f_hash, v_data in recognized.items():
-                    project_id = v_data.get('project_id')
-                    current_version = v_data.get('version_number', '—')
-                    matched_files = hash_to_file.get(f_hash, [])
+                    project_id = v_data.get("project_id")
+                    current_version = v_data.get("version_number", "—")
+                    matched_entries = hash_to_entries.get(f_hash, [])
                     latest_data = latest_map.get(project_id) if project_id else None
 
-                    for filename in matched_files:
+                    for entry in matched_entries:
+                        filename = entry["filename"]
+                        folder = entry["folder"]
+                        scan_title = entry["target"]["title"]
                         needs_update = False
                         status = "Загружен"
                         out_version = current_version
@@ -392,13 +531,15 @@ class FolderScannerWorker(QThread):
 
                         mod_info = {
                             "title": title,
+                            "scan_type": scan_title,
                             "version": out_version,
                             "status": status,
                             "project_id": project_id,
                             "filename": out_filename,
                             "display_name": filename,
+                            "source_folder": folder,
                             "url": out_url,
-                            "needs_update": needs_update
+                            "needs_update": needs_update,
                         }
                         self.mod_found.emit(mod_info)
         except Exception as e:
@@ -526,6 +667,10 @@ class ModManagerApp(QWidget):
         self.resize(1100, 650)
         self.http_session = requests.Session()
         self.mods_folder, self.download_folder, self.backup_folder = "", "", ""
+        self.instance_root = ""
+        self.scan_targets = []
+        self.auto_loader_hint = ""
+        self.auto_version_hint = ""
         self.active_downloads = []
         self.updated_mods = []
         self.pending_batch_updates = 0
@@ -546,6 +691,8 @@ class ModManagerApp(QWidget):
     def _on_api_data_ready(self, versions, loaders):
         self.version_box.clear()
         self.loader_box.clear()
+        self.version_box.addItem("Авто")
+        self.loader_box.addItem("Авто")
         self.version_box.addItems(versions)
         self.loader_box.addItems(loaders)
         self.status_lbl.setText("Готово к работе")
@@ -681,20 +828,49 @@ class ModManagerApp(QWidget):
         d.exec()
 
     def _set_scan_path(self, path):
-        self.mods_folder = path
+        self.scan_targets, self.instance_root = discover_scan_targets(path)
+        if not self.scan_targets:
+            return
+
+        self.auto_loader_hint, self.auto_version_hint = self._detect_instance_hints(self.scan_targets)
+
+        self.mods_folder = self.scan_targets[0]["folder"]
         self.scan_btn.setEnabled(True)
         self.table.setRowCount(0)
-        self.scanner = FolderScannerWorker(path, self.loader_box.currentText(), self.version_box.currentText(),
+        targets_summary = ", ".join(t["title"] for t in self.scan_targets)
+        self.status_lbl.setText(f"Выбрано: {targets_summary}")
+        self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(), self.version_box.currentText(),
                                            check_updates=False)
         self.scanner.mod_found.connect(self.add_mod_to_table)
         self.scanner.start()
 
+    def _detect_instance_hints(self, targets):
+        loader_counter = Counter()
+        version_counter = Counter()
+        for target in targets:
+            if target.get("project_type") != "mod":
+                continue
+            folder = target.get("folder")
+            if not folder or not os.path.isdir(folder):
+                continue
+            for name in os.listdir(folder):
+                if not name.lower().endswith(".jar"):
+                    continue
+                meta = read_archive_metadata(os.path.join(folder, name))
+                loader_counter.update(meta.get("loaders", set()))
+                version_counter.update(meta.get("mc_versions", set()))
+
+        loader_hint = loader_counter.most_common(1)[0][0] if loader_counter else ""
+        version_hint = version_counter.most_common(1)[0][0] if version_counter else ""
+        return loader_hint, version_hint
+
     def scan_folder(self):
-        if not self.mods_folder: return
+        if not self.scan_targets:
+            return
         self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Проверка обновлений")
-        self.scanner = FolderScannerWorker(self.mods_folder, self.loader_box.currentText(),
+        self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(),
                                            self.version_box.currentText(), check_updates=True)
         self.scanner.mod_found.connect(self.add_mod_to_table)
         self.scanner.finished.connect(lambda: self.set_loading(False))
@@ -712,10 +888,20 @@ class ModManagerApp(QWidget):
     def start_search(self):
         q = self.search_input.text().strip()
         if not q: return
+        selected_loader = self.loader_box.currentText()
+        selected_version = self.version_box.currentText()
+        worker_loader = selected_loader
+        worker_version = selected_version
+
+        if selected_loader == "Авто" and self.auto_loader_hint:
+            worker_loader = self.auto_loader_hint.capitalize()
+        if selected_version == "Авто" and self.auto_version_hint:
+            worker_version = self.auto_version_hint
+
         self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Поиск модов")
-        self.worker = ModSearchWorker(q, self.loader_box.currentText(), self.version_box.currentText())
+        self.worker = ModSearchWorker(q, worker_loader, worker_version)
 
         def on_done(res, ok):
             if ok:
@@ -731,7 +917,7 @@ class ModManagerApp(QWidget):
 
         items = [
             (0, res["title"]),
-            (1, res.get("author", "—")),
+            (1, res.get("author") or res.get("scan_type", "—")),
             (2, res.get("version", "—")),
             (3, res.get("status", "Неизвестно"))
         ]
@@ -739,11 +925,17 @@ class ModManagerApp(QWidget):
         for col, text in items:
             item = QTableWidgetItem(text)
             item.setToolTip(text)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if col == 0:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            else:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             if col == 0:
                 real_filename = res.get("display_name") or res.get("filename") or res["title"]
-                item.setData(Qt.ItemDataRole.UserRole, real_filename)
+                item.setData(Qt.ItemDataRole.UserRole, {
+                    "filename": real_filename,
+                    "source_folder": res.get("source_folder")
+                })
 
             if col == 3:
                 if res.get("needs_update"):
@@ -771,6 +963,7 @@ class ModManagerApp(QWidget):
             btn = QPushButton(btn_text)
             btn.setFixedWidth(100)
             btn.setProperty("project_id", res.get("project_id"))
+            btn.setProperty("source_folder", res.get("source_folder"))
             btn.clicked.connect(partial(
                 self.download,
                 row,
@@ -805,19 +998,20 @@ class ModManagerApp(QWidget):
                 self.set_loading(False)
                 return
 
-            target_backup_dir = self.backup_folder or os.path.join(self.mods_folder, "backups")
+            base_for_backup = self.instance_root or self.mods_folder
+            target_backup_dir = self.backup_folder or os.path.join(base_for_backup, "backups")
             os.makedirs(target_backup_dir, exist_ok=True)
 
-            mods_to_backup = [filename for _, _, filename in update_rows if filename]
-            for filename in mods_to_backup:
-                src = os.path.join(self.mods_folder, filename)
+            mods_to_backup = [(filename, source_folder) for _, _, filename, source_folder in update_rows if filename]
+            for filename, source_folder in mods_to_backup:
+                src = os.path.join(source_folder or self.mods_folder, filename)
                 if os.path.exists(src):
                     try:
                         shutil.copy2(src, os.path.join(target_backup_dir, filename))
                     except Exception as e:
                         logging.error(f"Ошибка бэкапа {filename}: {e}")
 
-        for _, btn, _ in update_rows:
+        for _, btn, _, _ in update_rows:
             btn.click()
 
     def _mark_batch_download_done(self, ok):
@@ -848,8 +1042,10 @@ class ModManagerApp(QWidget):
                 continue
 
             item = self.table.item(row, 0)
-            filename = item.data(Qt.ItemDataRole.UserRole) if item else None
-            updates.append((row, btn, filename))
+            payload = item.data(Qt.ItemDataRole.UserRole) if item else {}
+            filename = payload.get("filename") if isinstance(payload, dict) else payload
+            source_folder = payload.get("source_folder") if isinstance(payload, dict) else None
+            updates.append((row, btn, filename, source_folder))
         return updates
 
     def download(self, row, url, filename, needs_update):
@@ -858,8 +1054,9 @@ class ModManagerApp(QWidget):
             return
 
         project_id = btn.property("project_id")
+        source_folder = btn.property("source_folder")
         is_update = btn.text() == "Обновить"
-        save_dir = self.mods_folder if (is_update or not self.download_folder) else self.download_folder
+        save_dir = (source_folder or self.mods_folder) if (is_update or not self.download_folder) else self.download_folder
 
         if not save_dir:
             QMessageBox.warning(self, "!", "Выберите папку!")
@@ -869,10 +1066,8 @@ class ModManagerApp(QWidget):
 
         if project_id and is_update and needs_update:
             try:
-                candidate_files = [
-                    f for f in os.listdir(save_dir)
-                    if f.endswith(".jar") and f != filename
-                ]
+                file_ext = os.path.splitext(filename)[1].lower()
+                candidate_files = [f for f in os.listdir(save_dir) if f.lower().endswith(file_ext) and f != filename]
                 hash_to_file = {}
                 for existing_file in candidate_files:
                     existing_path = os.path.join(save_dir, existing_file)
@@ -947,7 +1142,10 @@ class ModManagerApp(QWidget):
         def on_done(path):
             btn.setText("Ок")
             self.table.item(row, 0).setText(filename)
-            self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, filename)
+            self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, {
+                "filename": filename,
+                "source_folder": source_folder
+            })
             self.status_lbl.setText(f"Скачано: {filename}")
 
             if os.path.exists(path):
