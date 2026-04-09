@@ -1,15 +1,38 @@
 import sys
 import os
-import requests
 import json
 import concurrent.futures
-import re
 import shutil
 import logging
 import time
 import random
+import re
+import importlib.util
+import subprocess
 from collections import Counter, defaultdict
 from functools import partial
+
+from utils import get_file_hash, read_archive_metadata
+
+REQUIRED_PACKAGES = {
+    "requests": "requests>=2.31",
+    "PyQt6": "PyQt6>=6.6",
+}
+
+
+def ensure_runtime_dependencies():
+    missing = [pkg for module_name, pkg in REQUIRED_PACKAGES.items() if importlib.util.find_spec(module_name) is None]
+    if not missing:
+        return
+
+    print(f"[ModManager] Не найдены зависимости: {', '.join(missing)}. Устанавливаю автоматически...")
+    pip_cmd = [sys.executable, "-m", "pip", "install", *missing]
+    subprocess.check_call(pip_cmd)
+
+
+ensure_runtime_dependencies()
+
+import requests
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTableWidget,
@@ -19,8 +42,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QAction
-
-from utils import get_file_hash, read_archive_metadata
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +59,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-VERSION = "1.7"
+VERSION = "1.6"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
@@ -52,7 +73,6 @@ SCAN_TYPE_RULES = {
     "Шейдеры": {"subdir": "shaderpacks", "extensions": (".zip",), "project_type": "shader"},
     "Текстур-паки": {"subdir": "resourcepacks", "extensions": (".zip",), "project_type": "resourcepack"},
 }
-
 _VERSION_RE = re.compile(r"(\d+|[a-zA-Z]+)")
 
 
@@ -111,21 +131,48 @@ def discover_scan_targets(selected_path):
 def request_with_retry(session, method, url, *, max_retries=MAX_RETRIES, retry_statuses=None, **kwargs):
     retry_statuses = retry_statuses or RETRYABLE_STATUS_CODES
     last_response = None
+    last_exception = None
 
     for attempt in range(max_retries):
-        response = session.request(method, url, **kwargs)
-        last_response = response
-        if response.status_code not in retry_statuses:
-            return response
+        try:
+            response = session.request(method, url, **kwargs)
+            last_response = response
+            if response.status_code not in retry_statuses:
+                return response
 
-        retry_after = response.headers.get("Retry-After")
-        if retry_after and retry_after.isdigit():
-            sleep_s = min(float(retry_after), 5.0)
-        else:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                sleep_s = min(float(retry_after), 5.0)
+            else:
+                sleep_s = (0.4 * (2 ** attempt)) + random.uniform(0, 0.2)
+            time.sleep(sleep_s)
+        except requests.RequestException as exc:
+            last_exception = exc
             sleep_s = (0.4 * (2 ** attempt)) + random.uniform(0, 0.2)
-        time.sleep(sleep_s)
+            time.sleep(sleep_s)
 
+    if last_response is None and last_exception is not None:
+        raise last_exception
     return last_response
+
+
+def _install_global_exception_hook():
+    original_hook = sys.excepthook
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        logging.exception("Необработанная ошибка приложения", exc_info=(exc_type, exc_value, exc_traceback))
+        try:
+            QMessageBox.critical(
+                None,
+                "Критическая ошибка",
+                "Произошла непредвиденная ошибка.\n"
+                "Подробности записаны в app.log."
+            )
+        except Exception:
+            pass
+        original_hook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = handle_exception
 
 
 class DownloadThread(QThread):
@@ -261,12 +308,13 @@ class ModSearchWorker(QThread):
                                 "author": hit["author"],
                                 "version": selected_v["version_number"],
                                 "project_id": hit["project_id"],
+                                "source_url": f"https://modrinth.com/project/{hit['project_id']}",
                                 "url": primary_file.get("url", ""),
                                 "filename": primary_file.get("filename", ""),
                                 "status": "Доступен",
                                 "needs_update": False
                             }
-                except Exception as e:
+                except (requests.RequestException, ValueError, KeyError) as e:
                     logging.error("Ошибка получения версии: %s", e)
                 return None
 
@@ -279,7 +327,7 @@ class ModSearchWorker(QThread):
 
             self.results_ready.emit(results, True)
 
-        except Exception as e:
+        except (requests.RequestException, ValueError, KeyError) as e:
             logging.error("Search error: %s", e)
             self.results_ready.emit([], False)
 
@@ -363,8 +411,8 @@ class FolderScannerWorker(QThread):
                         )
                         if p_res.status_code == 200:
                             return p_res.json().get("title") or project_id
-                    except Exception:
-                        pass
+                    except requests.RequestException as exc:
+                        logging.warning("Не удалось получить title проекта %s: %s", project_id, exc)
                     return project_id
 
                 project_loader_hints = defaultdict(set)
@@ -491,7 +539,7 @@ class FolderScannerWorker(QThread):
                             pid = title_futures[future]
                             try:
                                 title_map[pid] = future.result()
-                            except Exception:
+                            except (requests.RequestException, ValueError, KeyError):
                                 title_map[pid] = pid
 
                 for f_hash, v_data in recognized.items():
@@ -535,6 +583,7 @@ class FolderScannerWorker(QThread):
                             "version": out_version,
                             "status": status,
                             "project_id": project_id,
+                            "source_url": f"https://modrinth.com/project/{project_id}" if project_id else "",
                             "filename": out_filename,
                             "display_name": filename,
                             "source_folder": folder,
@@ -542,7 +591,7 @@ class FolderScannerWorker(QThread):
                             "needs_update": needs_update,
                         }
                         self.mod_found.emit(mod_info)
-        except Exception as e:
+        except (requests.RequestException, ValueError, OSError) as e:
             logging.error(f"Ошибка сканирования: {e}")
 
         self.finished.emit()
@@ -601,7 +650,7 @@ class AppUpdateWorker(QThread):
                     self.update_found.emit(remote_version)
             else:
                 logging.warning("GitHub API returned status %s", response.status_code)
-        except Exception as e:
+        except requests.RequestException as e:
             logging.error("Update check error: %s", e)
 
 
@@ -628,7 +677,7 @@ class ApiDataWorker(QThread):
                               if "mod" in l.get("supported_project_types", [])])
 
             self.data_loaded.emit(versions, loaders)
-        except Exception as e:
+        except (requests.RequestException, ValueError, KeyError) as e:
             self.error_occurred.emit(str(e))
 
 
@@ -653,7 +702,7 @@ class ModManagerApp(QWidget):
                     "download_folder": self.download_folder,
                     "backup_folder": self.backup_folder
                 }, conf)
-        except Exception as e:
+        except OSError as e:
             logging.error("Ошибка сохранения конфига: %s", e)
 
     def __init__(self):
@@ -706,7 +755,7 @@ class ModManagerApp(QWidget):
                     self.backup_folder = config.get("backup_folder", "")
                     if self.download_folder:
                         self.status_lbl.setText(f"Загрузка в: {self.download_folder}")
-            except Exception as e:
+            except (OSError, ValueError, json.JSONDecodeError) as e:
                 logging.error(f"Не удалось загрузить настройки: {e}")
 
     def _init_ui(self):
@@ -744,6 +793,9 @@ class ModManagerApp(QWidget):
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["Мод / Файл", "Источник", "Версия", "Статус", "Прогресс", "Действие"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setMouseTracking(True)
+        self.table.cellClicked.connect(self.open_source_link)
+        self.table.cellEntered.connect(self._handle_cell_entered)
 
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -784,7 +836,6 @@ class ModManagerApp(QWidget):
         self.backup_before_update_action = QAction("Резервное копирование перед обновлением", self)
         self.backup_before_update_action.setCheckable(True)
         self.backup_before_update_action.setChecked(False)
-        # Подсказки
         self.backup_before_update_action.setStatusTip("Сохраняет старые версии файлов в папку 'backups' перед заменой")
         self.backup_before_update_action.setToolTip(
             "Безопасное обновление: копия старого мода сохранится автоматически")
@@ -801,6 +852,24 @@ class ModManagerApp(QWidget):
         bottom.addWidget(self.scan_btn)
         bottom.addWidget(self.update_all_btn)
         layout.addLayout(bottom)
+
+    def open_source_link(self, row, column):
+        if column != 1:
+            return
+        item = self.table.item(row, column)
+        if not item:
+            return
+        source_url = item.data(Qt.ItemDataRole.UserRole)
+        if not source_url:
+            return
+        import webbrowser
+        webbrowser.open(source_url)
+
+    def _handle_cell_entered(self, row, col):
+        if col == 1:
+            self.table.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.table.setCursor(Qt.CursorShape.ArrowCursor)
 
     def select_custom_backup_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения бэкапов")
@@ -917,7 +986,7 @@ class ModManagerApp(QWidget):
 
         items = [
             (0, res["title"]),
-            (1, res.get("author") or res.get("scan_type", "—")),
+            (1, "🔗 Modrinth" if res.get("source_url") else (res.get("author") or res.get("scan_type", "—"))),
             (2, res.get("version", "—")),
             (3, res.get("status", "Неизвестно"))
         ]
@@ -943,6 +1012,10 @@ class ModManagerApp(QWidget):
                     self.update_all_btn.show()
                 elif "Актуально" in res.get("status", "") or "Загружен" in res.get("status", ""):
                     item.setForeground(QColor("#27ae60"))
+            if col == 1 and res.get("source_url"):
+                item.setData(Qt.ItemDataRole.UserRole, res.get("source_url"))
+                item.setToolTip(f"{res.get('source_url')}\n(нажмите для открытия)")
+                item.setForeground(QColor("#3498db"))
 
             self.table.setItem(row, col, item)
 
@@ -1121,7 +1194,7 @@ class ModManagerApp(QWidget):
                                     continue
                                 if existing_file in valid_filenames:
                                     files_to_delete_after_download.append(existing_file)
-            except Exception as e:
+            except (requests.RequestException, OSError) as e:
                 logging.error("Ошибка точной очистки: %s", e)
 
         files_to_delete_after_download = sorted(set(files_to_delete_after_download))
@@ -1155,7 +1228,7 @@ class ModManagerApp(QWidget):
                         try:
                             os.remove(old_path)
                             logging.info("Удалена старая версия мода после загрузки: %s", old_file)
-                        except Exception as e:
+                        except OSError as e:
                             logging.error("Не удалось удалить %s: %s", old_file, e)
 
             if os.path.exists(path) and filename not in self.updated_mods:
@@ -1200,7 +1273,7 @@ class ModManagerApp(QWidget):
                 try:
                     shutil.copy2(src, dst)
                     copied += 1
-                except Exception as e:
+                except OSError as e:
                     logging.error("Ошибка копирования %s: %s", filename, e)
                     errors.append(f"{filename} ({str(e)})")
 
@@ -1217,7 +1290,12 @@ class ModManagerApp(QWidget):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    w = ModManagerApp()
-    w.show()
-    sys.exit(app.exec())
+    _install_global_exception_hook()
+    try:
+        app = QApplication(sys.argv)
+        w = ModManagerApp()
+        w.show()
+        sys.exit(app.exec())
+    except Exception:
+        logging.exception("Критическая ошибка запуска приложения")
+        raise
