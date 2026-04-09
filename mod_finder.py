@@ -333,16 +333,15 @@ class ModSearchWorker(QThread):
 
 
 class FolderScannerWorker(QThread):
-    mod_found = pyqtSignal(dict)
+    progress = pyqtSignal(int)
+    result_ready = pyqtSignal(dict)
     finished = pyqtSignal()
 
-    def __init__(self, targets, loader, mc_ver, check_updates=False):
+    def __init__(self, mods_folder, loader, game_version):
         super().__init__()
-        self.targets = targets
-        self.loader = loader.lower()
-        self.mc_ver = mc_ver
-        self.check_updates = check_updates
-        self.session = requests.Session()
+        self.mods_folder = mods_folder
+        self.loader = loader
+        self.game_version = game_version
 
     def run(self):
         if not self.targets:
@@ -595,6 +594,38 @@ class FolderScannerWorker(QThread):
             logging.error(f"Ошибка сканирования: {e}")
 
         self.finished.emit()
+
+    def _fetch_dependency_data(self, project_id, loader, game_version):
+            """Получает данные о моде-зависимости через API"""
+            try:
+                project_url = f"https://api.modrinth.com/v2/project/{project_id}"
+                p_res = requests.get(project_url, timeout=5).json()
+
+                version_url = f"https://api.modrinth.com/v2/project/{project_id}/version"
+                params = {
+                    "loaders": json.dumps([loader.lower()]),
+                    "game_versions": json.dumps([game_version])
+                }
+                v_res = requests.get(version_url, params=params, timeout=5).json()
+
+                if v_res and len(v_res) > 0:
+                    latest = v_res[0]
+                    primary_file = next((f for f in latest['files'] if f['primary']), latest['files'][0])
+
+                    return {
+                        "title": p_res.get("title"),
+                        "version": latest.get("version_number"),
+                        "url": primary_file.get("url"),
+                        "filename": primary_file.get("filename"),
+                        "project_id": project_id,
+                        "source_url": f"https://modrinth.com/mod/{p_res.get('slug')}",
+                        "status": "Требуется установка",
+                        "is_dependency": True,  # Важный флаг для UI
+                        "needs_update": False
+                    }
+            except Exception as e:
+                logging.error(f"Ошибка при получении зависимости {project_id}: {e}")
+            return None
 
 
 class FolderSelectDialog(QDialog):
@@ -984,8 +1015,11 @@ class ModManagerApp(QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
+        is_dep = res.get("is_dependency", False)
+        title_text = f"  ↳ [Зависимость] {res['title']}" if is_dep else res["title"]
+
         items = [
-            (0, res["title"]),
+            (0, title_text),
             (1, "🔗 Modrinth" if res.get("source_url") else (res.get("author") or res.get("scan_type", "—"))),
             (2, res.get("version", "—")),
             (3, res.get("status", "Неизвестно"))
@@ -994,8 +1028,12 @@ class ModManagerApp(QWidget):
         for col, text in items:
             item = QTableWidgetItem(text)
             item.setToolTip(text)
+
             if col == 0:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                if is_dep:
+                    item.setForeground(QColor("#bdc3c7"))
+                    item.setData(Qt.ItemDataRole.UserRole + 1, "dependency")
             else:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -1012,6 +1050,7 @@ class ModManagerApp(QWidget):
                     self.update_all_btn.show()
                 elif "Актуально" in res.get("status", "") or "Загружен" in res.get("status", ""):
                     item.setForeground(QColor("#27ae60"))
+
             if col == 1 and res.get("source_url"):
                 item.setData(Qt.ItemDataRole.UserRole, res.get("source_url"))
                 item.setToolTip(f"{res.get('source_url')}\n(нажмите для открытия)")
@@ -1055,6 +1094,36 @@ class ModManagerApp(QWidget):
         update_rows = self._collect_update_rows()
         if not update_rows:
             QMessageBox.information(self, "Обновление", "Нет модов, требующих обновления.")
+            return
+
+        deps_to_update = []
+        main_mods_to_update = []
+
+        for row_data in update_rows:
+            row_index = row_data[0]
+            item = self.table.item(row_index, 0)
+            if item.data(Qt.ItemDataRole.UserRole + 1) == "dependency":
+                deps_to_update.append(row_data)
+            else:
+                main_mods_to_update.append(row_data)
+
+        if deps_to_update:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Обязательные зависимости")
+            msg.setText(f"Обнаружено {len(deps_to_update)} новых зависимостей для ваших модов.")
+            msg.setInformativeText("Скачать их вместе с остальными обновлениями?")
+            btn_yes = msg.addButton("Скачать всё", QMessageBox.ButtonRole.AcceptRole)
+            btn_no = msg.addButton("Только моды", QMessageBox.ButtonRole.RejectRole)
+            btn_cancel = msg.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+
+            msg.exec()
+
+            if msg.clickedButton() == btn_cancel:
+                return
+            elif msg.clickedButton() == btn_no:
+                update_rows = main_mods_to_update
+
+        if not update_rows:
             return
 
         self.batch_total_updates = len(update_rows)
