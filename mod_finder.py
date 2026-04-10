@@ -335,13 +335,16 @@ class ModSearchWorker(QThread):
 class FolderScannerWorker(QThread):
     progress = pyqtSignal(int)
     result_ready = pyqtSignal(dict)
+    mod_found = pyqtSignal(dict)
     finished = pyqtSignal()
 
-    def __init__(self, mods_folder, loader, game_version):
+    def __init__(self, targets, loader, game_version, check_updates=False):
         super().__init__()
-        self.mods_folder = mods_folder
-        self.loader = loader
-        self.game_version = game_version
+        self.targets = targets or []
+        self.loader = (loader or "").strip().lower()
+        self.mc_ver = (game_version or "").strip()
+        self.check_updates = check_updates
+        self.session = requests.Session()
 
     def run(self):
         if not self.targets:
@@ -541,6 +544,11 @@ class FolderScannerWorker(QThread):
                             except (requests.RequestException, ValueError, KeyError):
                                 title_map[pid] = pid
 
+                scanned_project_ids = set()
+                installed_project_ids = {
+                    data.get("project_id") for data in recognized.values() if data.get("project_id")
+                }
+
                 for f_hash, v_data in recognized.items():
                     project_id = v_data.get("project_id")
                     current_version = v_data.get("version_number", "—")
@@ -589,42 +597,100 @@ class FolderScannerWorker(QThread):
                             "url": out_url,
                             "needs_update": needs_update,
                         }
+                        self.result_ready.emit(mod_info)
                         self.mod_found.emit(mod_info)
+
+                    dependencies = v_data.get("dependencies") or []
+                    for dependency in dependencies:
+                        if dependency.get("dependency_type") != "required":
+                            continue
+                        dependency_project_id = dependency.get("project_id")
+                        if not dependency_project_id:
+                            continue
+                        if dependency_project_id in installed_project_ids:
+                            continue
+                        if dependency_project_id in scanned_project_ids:
+                            continue
+                        dep_data = self._fetch_dependency_data(dependency_project_id)
+                        if dep_data:
+                            scanned_project_ids.add(dependency_project_id)
+                            self.result_ready.emit(dep_data)
+                            self.mod_found.emit(dep_data)
         except (requests.RequestException, ValueError, OSError) as e:
             logging.error(f"Ошибка сканирования: {e}")
 
         self.finished.emit()
 
-    def _fetch_dependency_data(self, project_id, loader, game_version):
-            """Получает данные о моде-зависимости через API"""
-            try:
-                project_url = f"https://api.modrinth.com/v2/project/{project_id}"
-                p_res = requests.get(project_url, timeout=5).json()
+    def _fetch_dependency_data(self, project_id):
+        try:
+            project_response = request_with_retry(
+                self.session,
+                "GET",
+                f"{MODRINTH_API}/project/{project_id}",
+                headers=HEADERS,
+                timeout=8
+            )
+            if project_response.status_code != 200:
+                return None
+            project_data = project_response.json()
 
-                version_url = f"https://api.modrinth.com/v2/project/{project_id}/version"
-                params = {
-                    "loaders": json.dumps([loader.lower()]),
-                    "game_versions": json.dumps([game_version])
-                }
-                v_res = requests.get(version_url, params=params, timeout=5).json()
+            params = {}
+            if self.loader and self.loader != "авто":
+                params["loaders"] = json.dumps([self.loader])
+            if self.mc_ver and self.mc_ver != "Авто":
+                params["game_versions"] = json.dumps([self.mc_ver])
 
-                if v_res and len(v_res) > 0:
-                    latest = v_res[0]
-                    primary_file = next((f for f in latest['files'] if f['primary']), latest['files'][0])
+            version_response = request_with_retry(
+                self.session,
+                "GET",
+                f"{MODRINTH_API}/project/{project_id}/version",
+                params=params if params else None,
+                headers=HEADERS,
+                timeout=10
+            )
+            if version_response.status_code != 200:
+                return None
+            versions = version_response.json()
+            if not versions and params:
+                version_response = request_with_retry(
+                    self.session,
+                    "GET",
+                    f"{MODRINTH_API}/project/{project_id}/version",
+                    headers=HEADERS,
+                    timeout=10
+                )
+                if version_response.status_code != 200:
+                    return None
+                versions = version_response.json()
+            if not versions:
+                return None
 
-                    return {
-                        "title": p_res.get("title"),
-                        "version": latest.get("version_number"),
-                        "url": primary_file.get("url"),
-                        "filename": primary_file.get("filename"),
-                        "project_id": project_id,
-                        "source_url": f"https://modrinth.com/mod/{p_res.get('slug')}",
-                        "status": "Требуется установка",
-                        "is_dependency": True,  # Важный флаг для UI
-                        "needs_update": False
-                    }
-            except Exception as e:
-                logging.error(f"Ошибка при получении зависимости {project_id}: {e}")
+            selected_version = next((v for v in versions if v.get("version_type") == "release"), None)
+            if not selected_version:
+                selected_version = next((v for v in versions if v.get("version_type") == "beta"), None)
+            if not selected_version:
+                selected_version = versions[0]
+
+            files = selected_version.get("files") or []
+            if not files:
+                return None
+            primary_file = next((f for f in files if f.get("primary")), files[0])
+
+            project_slug = project_data.get("slug") or project_id
+            return {
+                "title": project_data.get("title") or project_id,
+                "version": selected_version.get("version_number", "—"),
+                "url": primary_file.get("url"),
+                "filename": primary_file.get("filename"),
+                "project_id": project_id,
+                "source_url": f"https://modrinth.com/project/{project_slug}",
+                "status": "Требуется установка",
+                "is_dependency": True,
+                "is_missing_dependency": True,
+                "needs_update": False
+            }
+        except (requests.RequestException, ValueError, KeyError) as e:
+            logging.error("Ошибка при получении зависимости %s: %s", project_id, e)
             return None
 
 
@@ -941,7 +1007,7 @@ class ModManagerApp(QWidget):
         self.status_lbl.setText(f"Выбрано: {targets_summary}")
         self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(), self.version_box.currentText(),
                                            check_updates=False)
-        self.scanner.mod_found.connect(self.add_mod_to_table)
+        self.scanner.result_ready.connect(self.add_mod_to_table)
         self.scanner.start()
 
     def _detect_instance_hints(self, targets):
@@ -972,7 +1038,7 @@ class ModManagerApp(QWidget):
         self.set_loading(True, "Проверка обновлений")
         self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(),
                                            self.version_box.currentText(), check_updates=True)
-        self.scanner.mod_found.connect(self.add_mod_to_table)
+        self.scanner.result_ready.connect(self.add_mod_to_table)
         self.scanner.finished.connect(lambda: self.set_loading(False))
         self.scanner.start()
 
@@ -1031,9 +1097,9 @@ class ModManagerApp(QWidget):
 
             if col == 0:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                item.setData(Qt.ItemDataRole.UserRole + 1, "dependency" if is_dep else "mod")
                 if is_dep:
                     item.setForeground(QColor("#bdc3c7"))
-                    item.setData(Qt.ItemDataRole.UserRole + 1, "dependency")
             else:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -1068,7 +1134,8 @@ class ModManagerApp(QWidget):
         pbar_layout.setContentsMargins(5, 0, 5, 0)
         self.table.setCellWidget(row, 4, pbar_container)
 
-        if res.get("url"):
+        allow_dependency_download = (not is_dep) or bool(res.get("is_missing_dependency"))
+        if res.get("url") and allow_dependency_download:
             btn_container = QWidget()
             btn_layout = QHBoxLayout(btn_container)
             btn_text = "Обновить" if res.get("needs_update") else "Скачать"
