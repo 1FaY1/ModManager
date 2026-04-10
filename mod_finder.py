@@ -59,7 +59,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-VERSION = "1.6"
+VERSION = "1.8"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
@@ -548,6 +548,12 @@ class FolderScannerWorker(QThread):
                 installed_project_ids = {
                     data.get("project_id") for data in recognized.values() if data.get("project_id")
                 }
+                known_version_project_map = {
+                    data.get("id"): data.get("project_id")
+                    for data in recognized.values()
+                    if data.get("id") and data.get("project_id")
+                }
+                resolved_dependency_version_map = {}
 
                 for f_hash, v_data in recognized.items():
                     project_id = v_data.get("project_id")
@@ -604,7 +610,11 @@ class FolderScannerWorker(QThread):
                     for dependency in dependencies:
                         if dependency.get("dependency_type") != "required":
                             continue
-                        dependency_project_id = dependency.get("project_id")
+                        dependency_project_id = self._resolve_dependency_project_id(
+                            dependency,
+                            known_version_project_map,
+                            resolved_dependency_version_map
+                        )
                         if not dependency_project_id:
                             continue
                         if dependency_project_id in installed_project_ids:
@@ -691,6 +701,39 @@ class FolderScannerWorker(QThread):
             }
         except (requests.RequestException, ValueError, KeyError) as e:
             logging.error("Ошибка при получении зависимости %s: %s", project_id, e)
+            return None
+
+    def _resolve_dependency_project_id(self, dependency, known_map, cache):
+        project_id = dependency.get("project_id")
+        if project_id:
+            return project_id
+
+        version_id = dependency.get("version_id")
+        if not version_id:
+            return None
+        if version_id in known_map:
+            return known_map[version_id]
+        if version_id in cache:
+            return cache[version_id]
+
+        try:
+            response = request_with_retry(
+                self.session,
+                "GET",
+                f"{MODRINTH_API}/version/{version_id}",
+                headers=HEADERS,
+                timeout=8
+            )
+            if response.status_code != 200:
+                cache[version_id] = None
+                return None
+            version_data = response.json()
+            resolved_project_id = version_data.get("project_id")
+            cache[version_id] = resolved_project_id
+            return resolved_project_id
+        except (requests.RequestException, ValueError, KeyError) as e:
+            logging.error("Ошибка определения project_id зависимости %s: %s", version_id, e)
+            cache[version_id] = None
             return None
 
 
@@ -821,6 +864,9 @@ class ModManagerApp(QWidget):
         self.updated_mods = []
         self.pending_batch_updates = 0
         self.batch_total_updates = 0
+        self.max_parallel_downloads = 4
+        self.batch_action_queue = []
+        self.active_batch_downloads = 0
 
         self._init_ui()
         self.load_settings()
@@ -1003,11 +1049,12 @@ class ModManagerApp(QWidget):
         self.mods_folder = self.scan_targets[0]["folder"]
         self.scan_btn.setEnabled(True)
         self.table.setRowCount(0)
+        self.update_all_btn.hide()
         targets_summary = ", ".join(t["title"] for t in self.scan_targets)
         self.status_lbl.setText(f"Выбрано: {targets_summary}")
         self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(), self.version_box.currentText(),
                                            check_updates=False)
-        self.scanner.result_ready.connect(self.add_mod_to_table)
+        self.scanner.result_ready.connect(self._handle_scanner_result)
         self.scanner.start()
 
     def _detect_instance_hints(self, targets):
@@ -1038,9 +1085,19 @@ class ModManagerApp(QWidget):
         self.set_loading(True, "Проверка обновлений")
         self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(),
                                            self.version_box.currentText(), check_updates=True)
-        self.scanner.result_ready.connect(self.add_mod_to_table)
-        self.scanner.finished.connect(lambda: self.set_loading(False))
+        self.scanner.result_ready.connect(self._handle_scanner_result)
+        self.scanner.finished.connect(self._handle_scanner_finished)
         self.scanner.start()
+
+    def _handle_scanner_result(self, res):
+        if self.sender() is not self.scanner:
+            return
+        self.add_mod_to_table(res)
+
+    def _handle_scanner_finished(self):
+        if self.sender() is not self.scanner:
+            return
+        self.set_loading(False)
 
     def select_download_folder(self):
         """Выбор папки, куда качать новые моды (по нажатию на ⋮ внизу)"""
@@ -1158,26 +1215,19 @@ class ModManagerApp(QWidget):
         self.table.scrollToBottom()
 
     def update_all_mods(self):
-        update_rows = self._collect_update_rows()
-        if not update_rows:
+        main_update_rows = self._collect_update_rows(include_dependencies=False)
+        dependency_rows = self._collect_update_rows(include_dependencies=True, dependency_only=True)
+
+        if not main_update_rows and not dependency_rows:
             QMessageBox.information(self, "Обновление", "Нет модов, требующих обновления.")
             return
 
-        deps_to_update = []
-        main_mods_to_update = []
+        update_rows = list(main_update_rows)
 
-        for row_data in update_rows:
-            row_index = row_data[0]
-            item = self.table.item(row_index, 0)
-            if item.data(Qt.ItemDataRole.UserRole + 1) == "dependency":
-                deps_to_update.append(row_data)
-            else:
-                main_mods_to_update.append(row_data)
-
-        if deps_to_update:
+        if dependency_rows:
             msg = QMessageBox(self)
             msg.setWindowTitle("Обязательные зависимости")
-            msg.setText(f"Обнаружено {len(deps_to_update)} новых зависимостей для ваших модов.")
+            msg.setText(f"Обнаружено {len(dependency_rows)} обязательных зависимостей для установки.")
             msg.setInformativeText("Скачать их вместе с остальными обновлениями?")
             btn_yes = msg.addButton("Скачать всё", QMessageBox.ButtonRole.AcceptRole)
             btn_no = msg.addButton("Только моды", QMessageBox.ButtonRole.RejectRole)
@@ -1188,7 +1238,9 @@ class ModManagerApp(QWidget):
             if msg.clickedButton() == btn_cancel:
                 return
             elif msg.clickedButton() == btn_no:
-                update_rows = main_mods_to_update
+                update_rows = list(main_update_rows)
+            else:
+                update_rows = list(main_update_rows) + list(dependency_rows)
 
         if not update_rows:
             return
@@ -1211,7 +1263,11 @@ class ModManagerApp(QWidget):
             target_backup_dir = self.backup_folder or os.path.join(base_for_backup, "backups")
             os.makedirs(target_backup_dir, exist_ok=True)
 
-            mods_to_backup = [(filename, source_folder) for _, _, filename, source_folder in update_rows if filename]
+            mods_to_backup = [
+                (filename, source_folder)
+                for _, btn, filename, source_folder in update_rows
+                if filename and btn and btn.text() == "Обновить"
+            ]
             for filename, source_folder in mods_to_backup:
                 src = os.path.join(source_folder or self.mods_folder, filename)
                 if os.path.exists(src):
@@ -1219,9 +1275,11 @@ class ModManagerApp(QWidget):
                         shutil.copy2(src, os.path.join(target_backup_dir, filename))
                     except Exception as e:
                         logging.error(f"Ошибка бэкапа {filename}: {e}")
+                QApplication.processEvents()
 
-        for _, btn, _, _ in update_rows:
-            btn.click()
+        self.batch_action_queue = list(update_rows)
+        self.active_batch_downloads = 0
+        self._pump_batch_downloads()
 
     def _mark_batch_download_done(self, ok):
         if self.pending_batch_updates <= 0:
@@ -1234,6 +1292,8 @@ class ModManagerApp(QWidget):
 
         if self.pending_batch_updates == 0:
             self.batch_total_updates = 0
+            self.batch_action_queue = []
+            self.active_batch_downloads = 0
             self.update_all_btn.setEnabled(True)
             self.set_loading(False)
 
@@ -1243,19 +1303,42 @@ class ModManagerApp(QWidget):
             return None
         return container.findChild(QPushButton)
 
-    def _collect_update_rows(self):
+    def _collect_update_rows(self, include_dependencies=False, dependency_only=False):
         updates = []
         for row in range(self.table.rowCount()):
             btn = self._get_action_button(row)
-            if not btn or btn.text() != "Обновить":
+            if not btn:
                 continue
-
             item = self.table.item(row, 0)
+            role = item.data(Qt.ItemDataRole.UserRole + 1) if item else "mod"
+            is_dependency = role == "dependency"
+
+            if dependency_only and not is_dependency:
+                continue
+            if not include_dependencies and is_dependency:
+                continue
+            if is_dependency:
+                if btn.text() != "Скачать":
+                    continue
+            else:
+                if btn.text() != "Обновить":
+                    continue
+
             payload = item.data(Qt.ItemDataRole.UserRole) if item else {}
             filename = payload.get("filename") if isinstance(payload, dict) else payload
             source_folder = payload.get("source_folder") if isinstance(payload, dict) else None
             updates.append((row, btn, filename, source_folder))
         return updates
+
+    def _pump_batch_downloads(self):
+        while self.batch_action_queue and self.active_batch_downloads < self.max_parallel_downloads:
+            _, btn, _, _ = self.batch_action_queue.pop(0)
+            if not btn:
+                continue
+            btn.setProperty("batch_run", True)
+            self.active_batch_downloads += 1
+            btn.click()
+            QApplication.processEvents()
 
     def download(self, row, url, filename, needs_update):
         btn = self._get_action_button(row)
@@ -1264,6 +1347,7 @@ class ModManagerApp(QWidget):
 
         project_id = btn.property("project_id")
         source_folder = btn.property("source_folder")
+        is_batch_run = bool(btn.property("batch_run"))
         is_update = btn.text() == "Обновить"
         save_dir = (source_folder or self.mods_folder) if (is_update or not self.download_folder) else self.download_folder
 
@@ -1273,7 +1357,7 @@ class ModManagerApp(QWidget):
 
         files_to_delete_after_download = []
 
-        if project_id and is_update and needs_update:
+        if project_id and is_update and needs_update and not is_batch_run:
             try:
                 file_ext = os.path.splitext(filename)[1].lower()
                 candidate_files = [f for f in os.listdir(save_dir) if f.lower().endswith(file_ext) and f != filename]
@@ -1283,6 +1367,7 @@ class ModManagerApp(QWidget):
                     file_hash = get_file_hash(existing_path)
                     if file_hash:
                         hash_to_file.setdefault(file_hash, []).append(existing_file)
+                    QApplication.processEvents()
 
                 recognized_processed = False
                 if hash_to_file:
@@ -1330,6 +1415,7 @@ class ModManagerApp(QWidget):
                                     continue
                                 if existing_file in valid_filenames:
                                     files_to_delete_after_download.append(existing_file)
+                                QApplication.processEvents()
             except (requests.RequestException, OSError) as e:
                 logging.error("Ошибка точной очистки: %s", e)
 
@@ -1350,6 +1436,7 @@ class ModManagerApp(QWidget):
 
         def on_done(path):
             btn.setText("Ок")
+            btn.setProperty("batch_run", False)
             self.table.item(row, 0).setText(filename)
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, {
                 "filename": filename,
@@ -1372,12 +1459,19 @@ class ModManagerApp(QWidget):
 
             cleanup()
             self._mark_batch_download_done(True)
+            if is_batch_run and self.active_batch_downloads > 0:
+                self.active_batch_downloads -= 1
+            self._pump_batch_downloads()
 
         def on_error(err_msg):
             QMessageBox.critical(self, "Ошибка", err_msg)
             btn.setEnabled(True)
+            btn.setProperty("batch_run", False)
             cleanup()
             self._mark_batch_download_done(False)
+            if is_batch_run and self.active_batch_downloads > 0:
+                self.active_batch_downloads -= 1
+            self._pump_batch_downloads()
 
         downloader.finished.connect(on_done)
         downloader.error.connect(on_error)
