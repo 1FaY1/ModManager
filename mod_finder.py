@@ -98,6 +98,36 @@ def is_version_newer(latest_version, current_version):
     return _version_key(latest_version) > _version_key(current_version)
 
 
+def _normalize_filename(value):
+    return (value or "").strip().lower()
+
+
+def _select_preferred_file(files, preferred_filename=""):
+    if not files:
+        return None
+
+    preferred = _normalize_filename(preferred_filename)
+
+    def file_score(file_data):
+        name = _normalize_filename(file_data.get("filename"))
+        score = 0
+        if file_data.get("primary"):
+            score += 50
+        if preferred and name == preferred:
+            score += 100
+        elif preferred and name:
+            preferred_stem = os.path.splitext(preferred)[0]
+            name_stem = os.path.splitext(name)[0]
+            if preferred_stem and name_stem:
+                if preferred_stem == name_stem:
+                    score += 30
+                elif preferred_stem in name_stem or name_stem in preferred_stem:
+                    score += 10
+        return score
+
+    return max(files, key=file_score)
+
+
 def discover_scan_targets(selected_path):
     selected_path = os.path.abspath(selected_path)
     targets = []
@@ -308,7 +338,7 @@ class ModSearchWorker(QThread):
                             files = selected_v.get("files") or []
                             if not files:
                                 return None
-                            primary_file = files[0]
+                            primary_file = _select_preferred_file(files)
 
                             return {
                                 "title": hit["title"],
@@ -435,7 +465,7 @@ class FolderScannerWorker(QThread):
                     for game_ver in data.get("game_versions", []) or []:
                         project_version_hints[pid].add(game_ver)
 
-                def find_latest_release(project_id, project_type):
+                def find_latest_release(project_id, project_type, preferred_filename="", installed_hash=None):
                     params = {}
                     primary_loader = loader_counter.most_common(1)[0][0] if loader_counter else None
                     primary_version = version_counter.most_common(1)[0][0] if version_counter else None
@@ -510,10 +540,18 @@ class FolderScannerWorker(QThread):
                     version_files = selected.get("files") or []
                     if not version_files:
                         return None
+                    selected_file = _select_preferred_file(version_files, preferred_filename)
+                    if not selected_file:
+                        return None
+
+                    selected_hash = ((selected_file.get("hashes") or {}).get("sha1") or "").lower()
+                    same_file = bool(installed_hash and selected_hash and installed_hash.lower() == selected_hash)
                     return {
                         "version": selected.get("version_number", "—"),
-                        "url": version_files[0].get("url"),
-                        "filename": version_files[0].get("filename")
+                        "url": selected_file.get("url"),
+                        "filename": selected_file.get("filename"),
+                        "sha1": selected_hash,
+                        "same_file": same_file
                     }
 
                 project_ids = {
@@ -561,11 +599,12 @@ class FolderScannerWorker(QThread):
                 }
                 resolved_dependency_version_map = {}
 
+                entry_latest_cache = {}
+
                 for f_hash, v_data in recognized.items():
                     project_id = v_data.get("project_id")
                     current_version = v_data.get("version_number", "—")
                     matched_entries = hash_to_entries.get(f_hash, [])
-                    latest_data = latest_map.get(project_id) if project_id else None
 
                     for entry in matched_entries:
                         filename = entry["filename"]
@@ -578,14 +617,38 @@ class FolderScannerWorker(QThread):
                         out_filename = filename
 
                         if self.check_updates:
+                            latest_data = None
+                            if project_id:
+                                cache_key = (project_id, _normalize_filename(filename))
+                                if cache_key in entry_latest_cache:
+                                    latest_data = entry_latest_cache[cache_key]
+                                else:
+                                    try:
+                                        latest_data = find_latest_release(
+                                            project_id,
+                                            project_type_map.get(project_id, "mod"),
+                                            preferred_filename=filename,
+                                            installed_hash=f_hash
+                                        )
+                                    except (requests.RequestException, ValueError, KeyError) as e:
+                                        logging.error("Ошибка получения версии %s (%s): %s", project_id, filename, e)
+                                        latest_data = None
+                                    entry_latest_cache[cache_key] = latest_data
+                            if not latest_data and project_id:
+                                latest_data = latest_map.get(project_id)
+
                             if latest_data and latest_data.get("version"):
                                 latest_version = latest_data["version"]
                                 out_version = latest_version
                                 out_url = latest_data.get("url")
                                 out_filename = latest_data.get("filename") or filename
+                                same_file = latest_data.get("same_file", False)
                                 if latest_version != current_version:
                                     needs_update = True
                                     status = f"Обновление: {current_version} → {latest_version}"
+                                elif not same_file:
+                                    needs_update = True
+                                    status = "Обновление файла: версия совпадает, но сборка другая"
                                 else:
                                     status = "Актуально"
                             else:
