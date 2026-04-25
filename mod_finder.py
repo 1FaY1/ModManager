@@ -9,6 +9,7 @@ import random
 import re
 import importlib.util
 import subprocess
+from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from functools import partial
 
@@ -72,6 +73,11 @@ SCAN_TYPE_RULES = {
     "Моды": {"subdir": "mods", "extensions": (".jar",), "project_type": "mod"},
     "Шейдеры": {"subdir": "shaderpacks", "extensions": (".zip",), "project_type": "shader"},
     "Текстур-паки": {"subdir": "resourcepacks", "extensions": (".zip",), "project_type": "resourcepack"},
+}
+PROJECT_TYPE_LOADER_LABELS = {
+    "mod": "Загрузчик:",
+    "shader": "Движок:",
+    "resourcepack": "Платформа:"
 }
 _VERSION_RE = re.compile(r"(\d+|[a-zA-Z]+)")
 
@@ -212,9 +218,10 @@ class DownloadThread(QThread):
 class ModSearchWorker(QThread):
     results_ready = pyqtSignal(list, bool)
 
-    def __init__(self, query, loader, mc_ver):
+    def __init__(self, query, loader, mc_ver, project_type="mod"):
         super().__init__()
         self.query, self.loader, self.mc_ver = query.strip(), loader, mc_ver
+        self.project_type = (project_type or "mod").strip().lower()
         self.session = requests.Session()
 
     def run(self):
@@ -224,7 +231,7 @@ class ModSearchWorker(QThread):
             loader_filter = clean_loader if clean_loader and clean_loader != "авто" else ""
             version_filter = clean_ver if clean_ver and clean_ver != "Авто" else ""
 
-            facets = ['["project_type:mod"]']
+            facets = [f'["project_type:{self.project_type}"]']
             if loader_filter:
                 facets.append(f'["categories:{loader_filter}"]')
             if version_filter:
@@ -430,40 +437,39 @@ class FolderScannerWorker(QThread):
 
                 def find_latest_release(project_id, project_type):
                     params = {}
-                    if project_type == "mod":
-                        primary_loader = loader_counter.most_common(1)[0][0] if loader_counter else None
-                        primary_version = version_counter.most_common(1)[0][0] if version_counter else None
-                        hint_loaders = project_loader_hints.get(project_id, set())
-                        hint_versions = project_version_hints.get(project_id, set())
+                    primary_loader = loader_counter.most_common(1)[0][0] if loader_counter else None
+                    primary_version = version_counter.most_common(1)[0][0] if version_counter else None
+                    hint_loaders = project_loader_hints.get(project_id, set())
+                    hint_versions = project_version_hints.get(project_id, set())
 
-                        loaders_for_query = set()
-                        if self.loader != "авто":
-                            loaders_for_query.add(self.loader)
-                        else:
-                            if hint_loaders:
-                                loaders_for_query.update(hint_loaders)
-                            elif primary_loader:
-                                loaders_for_query.add(primary_loader)
-                            else:
-                                loaders_for_query.update(detected_loaders)
-                        if adapter_present:
-                            loaders_for_query.update({"fabric", "forge"})
-                        loaders_for_query = {ldr for ldr in loaders_for_query if ldr}
-                        if loaders_for_query:
-                            params["loaders"] = json.dumps(sorted(loaders_for_query))
+                    loaders_for_query = set()
+                    if self.loader != "авто":
+                        loaders_for_query.add(self.loader)
+                    else:
+                        if hint_loaders:
+                            loaders_for_query.update(hint_loaders)
+                        elif project_type == "mod" and primary_loader:
+                            loaders_for_query.add(primary_loader)
+                        elif project_type == "mod":
+                            loaders_for_query.update(detected_loaders)
+                    if project_type == "mod" and adapter_present:
+                        loaders_for_query.update({"fabric", "forge"})
+                    loaders_for_query = {ldr for ldr in loaders_for_query if ldr}
+                    if loaders_for_query:
+                        params["loaders"] = json.dumps(sorted(loaders_for_query))
 
-                        versions_for_query = set()
-                        if self.mc_ver != "Авто":
-                            versions_for_query.add(self.mc_ver)
-                        else:
-                            if hint_versions:
-                                versions_for_query.update(hint_versions)
-                            elif primary_version:
-                                versions_for_query.add(primary_version)
-                            else:
-                                versions_for_query.update(detected_versions)
-                        if versions_for_query:
-                            params["game_versions"] = json.dumps(sorted(versions_for_query))
+                    versions_for_query = set()
+                    if self.mc_ver != "Авто":
+                        versions_for_query.add(self.mc_ver)
+                    else:
+                        if hint_versions:
+                            versions_for_query.update(hint_versions)
+                        elif project_type == "mod" and primary_version:
+                            versions_for_query.add(primary_version)
+                        elif project_type == "mod":
+                            versions_for_query.update(detected_versions)
+                    if versions_for_query:
+                        params["game_versions"] = json.dumps(sorted(versions_for_query))
 
                     vr = request_with_retry(
                         self.session,
@@ -796,7 +802,7 @@ class AppUpdateWorker(QThread):
 
 class ApiDataWorker(QThread):
     """Поток для загрузки тегов с Modrinth, чтобы окно не 'белело' при старте"""
-    data_loaded = pyqtSignal(list, list)
+    data_loaded = pyqtSignal(list, dict)
     error_occurred = pyqtSignal(str)
 
     def __init__(self):
@@ -813,10 +819,20 @@ class ApiDataWorker(QThread):
             l_resp = request_with_retry(self.session, "GET", f"{MODRINTH_API}/tag/loader", timeout=10)
             l_resp.raise_for_status()
             l_res = l_resp.json()
-            loaders = sorted([l['name'].capitalize() for l in l_res
-                              if "mod" in l.get("supported_project_types", [])])
+            loaders_by_type = defaultdict(set)
+            for loader in l_res:
+                name = loader.get("name")
+                if not name:
+                    continue
+                supported = loader.get("supported_project_types", []) or []
+                for project_type in supported:
+                    loaders_by_type[str(project_type).lower()].add(name.capitalize())
 
-            self.data_loaded.emit(versions, loaders)
+            normalized = {
+                key: sorted(values) for key, values in loaders_by_type.items()
+            }
+
+            self.data_loaded.emit(versions, normalized)
         except (requests.RequestException, ValueError, KeyError) as e:
             self.error_occurred.emit(str(e))
 
@@ -858,6 +874,9 @@ class ModManagerApp(QWidget):
         self.mods_folder, self.download_folder, self.backup_folder = "", "", ""
         self.instance_root = ""
         self.scan_targets = []
+        self.active_project_type = "mod"
+        self.available_versions = []
+        self.loaders_by_project_type = {}
         self.auto_loader_hint = ""
         self.auto_version_hint = ""
         self.active_downloads = []
@@ -880,12 +899,26 @@ class ModManagerApp(QWidget):
         self.update_worker.update_found.connect(self.ask_for_update)
         self.update_worker.start()
 
-    def _on_api_data_ready(self, versions, loaders):
+    def _on_api_data_ready(self, versions, loaders_by_type):
+        self.available_versions = list(versions)
+        self.loaders_by_project_type = dict(loaders_by_type or {})
+        self._refresh_loader_options()
+
+    def _resolve_active_project_type(self):
+        if len(self.scan_targets) == 1:
+            return (self.scan_targets[0].get("project_type") or "mod").lower()
+        return "mod"
+
+    def _refresh_loader_options(self):
+        project_type = (self.active_project_type or "mod").lower()
+        loaders = self.loaders_by_project_type.get(project_type) or self.loaders_by_project_type.get("mod") or []
+
         self.version_box.clear()
         self.loader_box.clear()
+        self.loader_label.setText(PROJECT_TYPE_LOADER_LABELS.get(project_type, "Загрузчик:"))
         self.version_box.addItem("Авто")
         self.loader_box.addItem("Авто")
-        self.version_box.addItems(versions)
+        self.version_box.addItems(self.available_versions)
         self.loader_box.addItems(loaders)
         self.status_lbl.setText("Готово к работе")
 
@@ -923,7 +956,8 @@ class ModManagerApp(QWidget):
 
         self.loader_box = QComboBox()
         self.version_box = QComboBox()
-        nav.addWidget(QLabel("Загрузчик:"))
+        self.loader_label = QLabel("Загрузчик:")
+        nav.addWidget(self.loader_label)
         nav.addWidget(self.loader_box)
         nav.addWidget(QLabel("Версия:"))
         nav.addWidget(self.version_box)
@@ -1044,6 +1078,8 @@ class ModManagerApp(QWidget):
         if not self.scan_targets:
             return
 
+        self.active_project_type = self._resolve_active_project_type()
+        self._refresh_loader_options()
         self.auto_loader_hint, self.auto_version_hint = self._detect_instance_hints(self.scan_targets)
 
         self.mods_folder = self.scan_targets[0]["folder"]
@@ -1124,7 +1160,7 @@ class ModManagerApp(QWidget):
         self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Поиск модов")
-        self.worker = ModSearchWorker(q, worker_loader, worker_version)
+        self.worker = ModSearchWorker(q, worker_loader, worker_version, project_type=self.active_project_type)
 
         def on_done(res, ok):
             if ok:
@@ -1215,11 +1251,25 @@ class ModManagerApp(QWidget):
         self.table.scrollToBottom()
 
     def update_all_mods(self):
+        removed_duplicates = self._cleanup_duplicate_versions_before_batch()
+        if removed_duplicates > 0:
+            self.status_lbl.setText(
+                f"🧹 Удалено старых дубликатов модов: {removed_duplicates}"
+            )
+            QApplication.processEvents()
+
         main_update_rows = self._collect_update_rows(include_dependencies=False)
         dependency_rows = self._collect_update_rows(include_dependencies=True, dependency_only=True)
 
         if not main_update_rows and not dependency_rows:
-            QMessageBox.information(self, "Обновление", "Нет модов, требующих обновления.")
+            if removed_duplicates > 0:
+                QMessageBox.information(
+                    self,
+                    "Очистка завершена",
+                    f"Удалено старых дубликатов: {removed_duplicates}.\nНовых обновлений не найдено."
+                )
+            else:
+                QMessageBox.information(self, "Обновление", "Нет модов, требующих обновления.")
             return
 
         update_rows = list(main_update_rows)
@@ -1244,6 +1294,12 @@ class ModManagerApp(QWidget):
 
         if not update_rows:
             return
+
+        if removed_duplicates > 0:
+            self.status_lbl.setText(
+                f"🧹 Удалено старых дубликатов модов: {removed_duplicates}. Запускаю обновление..."
+            )
+            QApplication.processEvents()
 
         self.batch_total_updates = len(update_rows)
         self.pending_batch_updates = len(update_rows)
@@ -1291,6 +1347,9 @@ class ModManagerApp(QWidget):
         self.status_lbl.setText(f"{prefix} Обновление модов: {completed}/{self.batch_total_updates}")
 
         if self.pending_batch_updates == 0:
+            removed_after_batch = self._cleanup_duplicate_versions_before_batch()
+            if removed_after_batch > 0:
+                self.status_lbl.setText(f"🧹 Финальная очистка: удалено дублей {removed_after_batch}")
             self.batch_total_updates = 0
             self.batch_action_queue = []
             self.active_batch_downloads = 0
@@ -1340,6 +1399,175 @@ class ModManagerApp(QWidget):
             btn.click()
             QApplication.processEvents()
 
+    @staticmethod
+    def _parse_iso_datetime(raw_value):
+        if not raw_value:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            return datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _derive_mod_family_key(filename):
+        name_without_ext = os.path.splitext(filename)[0].lower()
+        match = re.search(r"[-_.]v?\d", name_without_ext)
+        if match:
+            return name_without_ext[:match.start()].strip("-_. ")
+        return name_without_ext
+
+    def _collect_hash_index(self, folder):
+        hash_to_files = defaultdict(list)
+        jar_files = [f for f in os.listdir(folder) if f.lower().endswith(".jar")]
+        for mod_file in jar_files:
+            mod_path = os.path.join(folder, mod_file)
+            if not os.path.isfile(mod_path):
+                continue
+            file_hash = get_file_hash(mod_path)
+            if file_hash:
+                hash_to_files[file_hash].append(mod_file)
+        return hash_to_files, jar_files
+
+    def _fetch_recognized_files(self, hashes):
+        if not hashes:
+            return {}
+        response = request_with_retry(
+            self.http_session,
+            "POST",
+            f"{MODRINTH_API}/version_files",
+            json={"hashes": list(hashes), "algorithm": "sha1"},
+            headers=HEADERS,
+            timeout=20
+        )
+        if response.status_code != 200:
+            return {}
+        return response.json()
+
+    def _remove_file_list(self, folder, filenames, keep_name):
+        removed = 0
+        for name in filenames:
+            if name == keep_name:
+                continue
+            old_path = os.path.join(folder, name)
+            if not os.path.exists(old_path):
+                continue
+            try:
+                os.remove(old_path)
+                removed += 1
+                logging.info("Удалена дублирующая версия %s (оставлен %s)", name, keep_name)
+            except OSError as exc:
+                logging.error("Не удалось удалить %s: %s", name, exc)
+        return removed
+
+    def _cleanup_duplicate_versions_in_folder(self, folder):
+        if not folder or not os.path.isdir(folder):
+            return 0
+
+        hash_to_files, jar_files = self._collect_hash_index(folder)
+        if len(jar_files) < 2 or not hash_to_files:
+            return 0
+
+        try:
+            recognized = self._fetch_recognized_files(hash_to_files.keys())
+        except requests.RequestException as exc:
+            logging.error("Не удалось очистить дубликаты в %s: %s", folder, exc)
+            return 0
+
+        grouped = defaultdict(list)
+        for file_hash, data in recognized.items():
+            project_id = data.get("project_id")
+            if not project_id:
+                continue
+            published = self._parse_iso_datetime(data.get("date_published"))
+            version_number = data.get("version_number", "")
+            for file_name in hash_to_files.get(file_hash, []):
+                path = os.path.join(folder, file_name)
+                if os.path.exists(path):
+                    grouped[project_id].append((file_name, published, version_number, os.path.getmtime(path)))
+
+        removed_count = 0
+        for versions in grouped.values():
+            if len(versions) < 2:
+                continue
+            keep_name, _, _, _ = max(
+                versions,
+                key=lambda entry: (entry[1], _version_key(entry[2]), entry[3])
+            )
+            removed_count += self._remove_file_list(folder, [name for name, *_ in versions], keep_name)
+        return removed_count
+
+    def _cleanup_duplicate_versions_before_batch(self, update_rows=None):
+        folders = set()
+        if update_rows:
+            for _, btn, _, source_folder in update_rows:
+                if btn and btn.text() == "Обновить":
+                    folders.add(source_folder or self.mods_folder)
+        else:
+            for target in self.scan_targets:
+                if target.get("project_type") == "mod" and target.get("folder"):
+                    folders.add(target["folder"])
+            if self.mods_folder and not folders:
+                folders.add(self.mods_folder)
+
+        return sum(self._cleanup_duplicate_versions_in_folder(folder) for folder in folders)
+
+    def _cleanup_project_duplicates_in_folder(self, folder, project_id, keep_filename):
+        if not folder or not os.path.isdir(folder) or not project_id:
+            return 0
+
+        hash_to_files, jar_files = self._collect_hash_index(folder)
+        if len(jar_files) < 2 or not hash_to_files:
+            return 0
+
+        removed_count = 0
+        recognized_entries = []
+        try:
+            recognized = self._fetch_recognized_files(hash_to_files.keys())
+            for file_hash, data in recognized.items():
+                if data.get("project_id") != project_id:
+                    continue
+                published = self._parse_iso_datetime(data.get("date_published"))
+                version_number = data.get("version_number", "")
+                for file_name in hash_to_files.get(file_hash, []):
+                    path = os.path.join(folder, file_name)
+                    if os.path.exists(path):
+                        recognized_entries.append(
+                            (file_name, published, version_number, os.path.getmtime(path))
+                        )
+        except requests.RequestException as exc:
+            logging.error("Не удалось сделать post-cleanup для %s: %s", project_id, exc)
+
+        if recognized_entries:
+            keep_name, _, _, _ = max(
+                recognized_entries,
+                key=lambda entry: (
+                    1 if entry[0] == keep_filename else 0,
+                    entry[1],
+                    _version_key(entry[2]),
+                    entry[3]
+                )
+            )
+            return self._remove_file_list(folder, [name for name, *_ in recognized_entries], keep_name)
+
+        keep_family = self._derive_mod_family_key(keep_filename)
+        family_candidates = []
+        for mod_file in jar_files:
+            if self._derive_mod_family_key(mod_file) != keep_family:
+                continue
+            path = os.path.join(folder, mod_file)
+            if os.path.exists(path):
+                family_candidates.append((mod_file, os.path.getmtime(path)))
+
+        if len(family_candidates) < 2:
+            return 0
+
+        family_candidates.sort(
+            key=lambda item: (1 if item[0] == keep_filename else 0, item[1]),
+            reverse=True
+        )
+        keep_name = family_candidates[0][0]
+        return self._remove_file_list(folder, [name for name, _ in family_candidates], keep_name)
+
     def download(self, row, url, filename, needs_update):
         btn = self._get_action_button(row)
         if not btn:
@@ -1357,7 +1585,7 @@ class ModManagerApp(QWidget):
 
         files_to_delete_after_download = []
 
-        if project_id and is_update and needs_update and not is_batch_run:
+        if project_id and is_update and needs_update:
             try:
                 file_ext = os.path.splitext(filename)[1].lower()
                 candidate_files = [f for f in os.listdir(save_dir) if f.lower().endswith(file_ext) and f != filename]
@@ -1453,6 +1681,10 @@ class ModManagerApp(QWidget):
                             logging.info("Удалена старая версия мода после загрузки: %s", old_file)
                         except OSError as e:
                             logging.error("Не удалось удалить %s: %s", old_file, e)
+                if project_id:
+                    removed_post = self._cleanup_project_duplicates_in_folder(save_dir, project_id, filename)
+                    if removed_post:
+                        logging.info("Post-cleanup удалил %s дублей для project_id=%s", removed_post, project_id)
 
             if os.path.exists(path) and filename not in self.updated_mods:
                 self.updated_mods.append(filename)
