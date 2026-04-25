@@ -28,7 +28,14 @@ def ensure_runtime_dependencies():
 
     print(f"[ModManager] Не найдены зависимости: {', '.join(missing)}. Устанавливаю автоматически...")
     pip_cmd = [sys.executable, "-m", "pip", "install", *missing]
-    subprocess.check_call(pip_cmd)
+    try:
+        subprocess.check_call(pip_cmd)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Не удалось автоматически установить зависимости. "
+            "Проверьте подключение к интернету и права на установку пакетов, "
+            "затем выполните: pip install requests PyQt6"
+        ) from exc
 
 
 ensure_runtime_dependencies()
@@ -60,7 +67,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-VERSION = "1.8"
+VERSION = "1.9"
 MODRINTH_API = "https://api.modrinth.com/v2"
 HEADERS = {"User-Agent": f"MyMinecraftManager/{VERSION}"}
 WORKER_THREADS = 8
