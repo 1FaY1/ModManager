@@ -9,6 +9,7 @@ import random
 import re
 import importlib.util
 import subprocess
+import zipfile
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from functools import partial
@@ -231,12 +232,12 @@ class DownloadThread(QThread):
     def run(self):
         try:
             with request_with_retry(
-                self.session,
-                "GET",
-                self.url,
-                stream=True,
-                headers=HEADERS,
-                timeout=20
+                    self.session,
+                    "GET",
+                    self.url,
+                    stream=True,
+                    headers=HEADERS,
+                    timeout=(10, 60)
             ) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
@@ -870,6 +871,329 @@ class AppUpdateWorker(QThread):
             logging.error("Update check error: %s", e)
 
 
+class MrPackImportWorker(QThread):
+    """Скачивает моды из распарсенного modrinth.index.json"""
+    progress = pyqtSignal(int, int)  # (скачано, всего)
+    mod_done = pyqtSignal(str, bool)  # (filename, success)
+    finished = pyqtSignal(int, int)  # (успешно, ошибок)
+
+    def __init__(self, mods, dest_folder):
+        super().__init__()
+        self.mods = mods  # список dict из modrinth.index.json
+        self.dest_folder = dest_folder
+        self.session = requests.Session()
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        ok = 0
+        fail = 0
+        total = len(self.mods)
+
+        for i, mod in enumerate(self.mods):
+            if self._stop:
+                break
+
+            filename = mod.get("filename") or os.path.basename(mod.get("path", f"mod_{i}.jar"))
+            filename = os.path.basename(filename)
+            dest_path = os.path.join(self.dest_folder, filename)
+
+            if os.path.exists(dest_path):
+                self.progress.emit(i + 1, total)
+                self.mod_done.emit(filename, True)
+                ok += 1
+                continue
+
+            downloaded = False
+            for url in mod.get("downloads", []):
+                try:
+                    r = request_with_retry(
+                        self.session, "GET", url,
+                        stream=True, headers=HEADERS,
+                        timeout=(10, 60)
+                    )
+                    r.raise_for_status()
+                    with open(dest_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    downloaded = True
+                    break
+                except (requests.RequestException, OSError) as e:
+                    logging.error("MrPack: ошибка загрузки %s: %s", filename, e)
+
+            if downloaded:
+                ok += 1
+                self.mod_done.emit(filename, True)
+            else:
+                fail += 1
+                self.mod_done.emit(filename, False)
+
+            self.progress.emit(i + 1, total)
+
+        self.finished.emit(ok, fail)
+
+
+class MrPackDialog(QDialog):
+    """Диалог импорта .mrpack сборки"""
+
+    def __init__(self, mrpack_path, parent=None):
+        super().__init__(parent)
+        self.mrpack_path = mrpack_path
+        self.mods = []
+        self.dest_folder = ""
+        self.worker = None
+
+        self.setWindowTitle("Импорт .mrpack сборки")
+        self.setMinimumSize(700, 500)
+        self.setModal(True)
+
+        self._init_ui()
+        self._parse_mrpack()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Заголовок
+        self.title_lbl = QLabel("Парсинг файла...")
+        self.title_lbl.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(self.title_lbl)
+
+        self.info_lbl = QLabel("")
+        self.info_lbl.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+        layout.addWidget(self.info_lbl)
+
+        # Таблица модов
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Файл", "Версия", "Статус"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        layout.addWidget(self.table)
+
+        # Прогресс
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # Кнопки
+        btn_row = QHBoxLayout()
+        self.folder_lbl = QLabel("Папка не выбрана")
+        self.folder_lbl.setStyleSheet("color: #e67e22; font-size: 11px;")
+        btn_row.addWidget(self.folder_lbl, stretch=1)
+
+        self.choose_folder_btn = QPushButton("📂 Выбрать папку")
+        self.choose_folder_btn.clicked.connect(self._choose_folder)
+        btn_row.addWidget(self.choose_folder_btn)
+
+        self.download_btn = QPushButton("⬇️ Скачать все")
+        self.download_btn.setEnabled(False)
+        self.download_btn.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold;")
+        self.download_btn.clicked.connect(self._start_download)
+        btn_row.addWidget(self.download_btn)
+
+        self.cancel_btn = QPushButton("Закрыть")
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        btn_row.addWidget(self.cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    def _parse_mrpack(self):
+        """Распаковывает modrinth.index.json из .mrpack файла"""
+        try:
+            with zipfile.ZipFile(self.mrpack_path, "r") as zf:
+                if "modrinth.index.json" not in zf.namelist():
+                    QMessageBox.critical(self, "Ошибка",
+                                         "Файл не содержит modrinth.index.json.\nЭто не валидный .mrpack файл.")
+                    self.reject()
+                    return
+
+                with zf.open("modrinth.index.json") as fp:
+                    index = json.loads(fp.read().decode("utf-8"))
+
+            pack_name = index.get("name", "Неизвестная сборка")
+            mc_version = ""
+            loader_name = ""
+
+            # Читаем версии из dependencies
+            deps = index.get("dependencies", {})
+            mc_version = deps.get("minecraft", "")
+            for key in ("forge", "fabric-loader", "quilt-loader", "neoforge"):
+                if key in deps:
+                    loader_name = key.replace("-loader", "").replace("neoforge", "NeoForge").capitalize()
+                    break
+
+            self.title_lbl.setText(f"Сборка: {pack_name}")
+            info_parts = []
+            if mc_version:
+                info_parts.append(f"Minecraft {mc_version}")
+            if loader_name:
+                info_parts.append(loader_name)
+            self.info_lbl.setText("  •  ".join(info_parts) if info_parts else "")
+
+            # Парсим список файлов — только те что нужно качать с Modrinth/CDN
+            raw_files = index.get("files", [])
+            self.mods = []
+            for entry in raw_files:
+                # env: required для client или both
+                env = entry.get("env", {})
+                client_env = env.get("client", "required")
+                if client_env == "unsupported":
+                    continue
+
+                path = entry.get("path", "")
+                # Берём только моды (путь начинается с mods/)
+                # Шейдеры/ресурспаки тоже поддержим
+                filename = os.path.basename(path)
+                if not filename:
+                    continue
+
+                self.mods.append({
+                    "filename": filename,
+                    "path": path,
+                    "downloads": entry.get("downloads", []),
+                    "fileSize": entry.get("fileSize", 0),
+                })
+
+            # Заполняем таблицу
+            self.table.setRowCount(0)
+            for mod in self.mods:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                self.table.setItem(row, 0, QTableWidgetItem(mod["filename"]))
+                size_kb = mod["fileSize"] // 1024 if mod["fileSize"] else 0
+                self.table.setItem(row, 1, QTableWidgetItem(f"{size_kb} KB" if size_kb else "—"))
+                status_item = QTableWidgetItem("Ожидание")
+                status_item.setForeground(QColor("#7f8c8d"))
+                self.table.setItem(row, 2, status_item)
+
+            total = len(self.mods)
+            self.info_lbl.setText(
+                (self.info_lbl.text() + f"  •  Модов: {total}").lstrip("  •  ")
+            )
+
+        except (zipfile.BadZipFile, json.JSONDecodeError, KeyError) as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
+            self.reject()
+
+    def _choose_folder(self):
+        """Выбор папки назначения, с предложением перенести существующие моды"""
+        folder = QFileDialog.getExistingDirectory(self, "Куда скачивать моды из сборки?")
+        if not folder:
+            return
+
+        self.dest_folder = folder
+        self.folder_lbl.setText(f"📁 {folder}")
+        self.folder_lbl.setStyleSheet("color: #27ae60; font-size: 11px;")
+        self.download_btn.setEnabled(True)
+
+        existing_jars = [
+            f for f in os.listdir(folder)
+            if f.lower().endswith(".jar") and os.path.isfile(os.path.join(folder, f))
+        ]
+        if not existing_jars:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "В папке есть моды",
+            f"В выбранной папке найдено {len(existing_jars)} файлов модов.\n\n"
+            "Переместить их в другую папку перед скачиванием сборки?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        move_to = QFileDialog.getExistingDirectory(self, "Куда переместить существующие моды?")
+        if not move_to:
+            return
+
+        moved = 0
+        errors = []
+        for filename in existing_jars:
+            src = os.path.join(folder, filename)
+            dst = os.path.join(move_to, filename)
+            try:
+                # shutil.move работает между разными дисками (D:\ -> C:\ и т.д.)
+                shutil.move(src, dst)
+                moved += 1
+            except OSError as e:
+                logging.error("MrPack: не удалось переместить %s: %s", filename, e)
+                errors.append(filename)
+
+        msg = f"Перемещено файлов: {moved}"
+        if errors:
+            msg += f"\nНе удалось переместить ({len(errors)}): {', '.join(errors[:3])}"
+        QMessageBox.information(self, "Перемещение завершено", msg)
+
+    def _start_download(self):
+        if not self.dest_folder:
+            QMessageBox.warning(self, "!", "Сначала выберите папку.")
+            return
+
+        os.makedirs(self.dest_folder, exist_ok=True)
+
+        self.download_btn.setEnabled(False)
+        self.choose_folder_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(self.mods))
+        self.progress_bar.setValue(0)
+
+        # Сбрасываем статусы в таблице
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 2)
+            if item:
+                item.setText("В очереди")
+                item.setForeground(QColor("#7f8c8d"))
+
+        self.worker = MrPackImportWorker(self.mods, self.dest_folder)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.mod_done.connect(self._on_mod_done)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.start()
+
+    def _on_progress(self, done, _total):
+        self.progress_bar.setValue(done)
+
+    def _on_mod_done(self, filename, success):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.text() == filename:
+                status_item = self.table.item(row, 2)
+                if status_item:
+                    if success:
+                        status_item.setText("✅ Скачан")
+                        status_item.setForeground(QColor("#27ae60"))
+                    else:
+                        status_item.setText("❌ Ошибка")
+                        status_item.setForeground(QColor("#e74c3c"))
+                self.table.scrollToItem(item)
+                break
+
+    def _on_finished(self, ok, fail):
+        self.cancel_btn.setText("Закрыть")
+        self.progress_bar.setValue(self.progress_bar.maximum())
+
+        msg = f"Загрузка завершена!\n\nУспешно: {ok}"
+        if fail:
+            msg += f"\nОшибок: {fail}"
+        QMessageBox.information(self, "Готово", msg)
+
+    def _on_cancel(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait()
+        self.accept()
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait()
+        event.accept()
+
+
 class ApiDataWorker(QThread):
     """Поток для загрузки тегов с Modrinth, чтобы окно не 'белело' при старте"""
     data_loaded = pyqtSignal(list, dict)
@@ -1035,6 +1359,9 @@ class ModManagerApp(QWidget):
         scan_dir_btn = QPushButton("📂 Выбрать сборку")
         scan_dir_btn.clicked.connect(self.select_scan_folder)
         nav.addWidget(scan_dir_btn)
+        mrpack_btn = QPushButton("📦 Импорт .mrpack")
+        mrpack_btn.clicked.connect(self.import_mrpack)
+        nav.addWidget(mrpack_btn)
         layout.addLayout(nav)
 
         self.table = QTableWidget(0, 6)
@@ -1399,8 +1726,8 @@ class ModManagerApp(QWidget):
                 if os.path.exists(src):
                     try:
                         shutil.copy2(src, os.path.join(target_backup_dir, filename))
-                    except Exception as e:
-                        logging.error(f"Ошибка бэкапа {filename}: {e}")
+                    except OSError as e:
+                        logging.error("Ошибка бэкапа %s: %s", filename, e)
                 QApplication.processEvents()
 
         self.batch_action_queue = list(update_rows)
@@ -1819,6 +2146,20 @@ class ModManagerApp(QWidget):
             QMessageBox.warning(self, "Результат копирования с ошибками", msg)
         else:
             QMessageBox.information(self, "Резервное копирование", msg)
+
+    def import_mrpack(self):
+        """Открыть .mrpack файл и показать диалог импорта"""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать .mrpack файл",
+            "",
+            "Modrinth Pack (*.mrpack);;Все файлы (*)"
+        )
+        if not path:
+            return
+
+        dlg = MrPackDialog(path, parent=self)
+        dlg.exec()
 
 
 if __name__ == "__main__":
