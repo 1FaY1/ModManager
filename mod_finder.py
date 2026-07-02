@@ -43,6 +43,13 @@ def _version_tuple(v: str):
 
 
 def ensure_runtime_dependencies():
+    # В собранном PyInstaller-экзешнике все зависимости уже вшиты внутрь.
+    # sys.executable там указывает на сам .exe, а не на python.exe —
+    # попытка вызвать "pip install" была бы бессмысленной и могла бы
+    # зависнуть/упасть с непонятной ошибкой у пользователя без Python.
+    if getattr(sys, "frozen", False):
+        return
+
     missing = []
     for module_name, pkg_spec in REQUIRED_PACKAGES.items():
         if importlib.util.find_spec(module_name) is None:
