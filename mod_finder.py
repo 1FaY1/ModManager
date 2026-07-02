@@ -1,6 +1,8 @@
 import sys
 import os
 import json
+import sqlite3
+import threading
 import concurrent.futures
 import shutil
 import logging
@@ -9,10 +11,14 @@ import random
 import re
 import importlib.util
 import subprocess
+import webbrowser
 import zipfile
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from functools import partial
+from typing import Optional, cast
+
+from importlib import metadata as importlib_metadata
 
 from utils import get_file_hash, read_archive_metadata
 
@@ -22,35 +28,64 @@ REQUIRED_PACKAGES = {
 }
 
 
+def _parse_min_version(spec: str):
+    if ">=" in spec:
+        return spec.split(">=", 1)[1].strip()
+    return None
+
+
+def _version_tuple(v: str):
+    parts = []
+    for chunk in v.split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
 def ensure_runtime_dependencies():
-    missing = [pkg for module_name, pkg in REQUIRED_PACKAGES.items() if importlib.util.find_spec(module_name) is None]
+    missing = []
+    for module_name, pkg_spec in REQUIRED_PACKAGES.items():
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(pkg_spec)
+            continue
+        min_version = _parse_min_version(pkg_spec)
+        if not min_version:
+            continue
+        try:
+            installed = importlib_metadata.version(module_name)
+        except importlib_metadata.PackageNotFoundError:
+            missing.append(pkg_spec)
+            continue
+        if _version_tuple(installed) < _version_tuple(min_version):
+            missing.append(pkg_spec)
+
     if not missing:
         return
 
-    print(f"[ModManager] Не найдены зависимости: {', '.join(missing)}. Устанавливаю автоматически...")
-    pip_cmd = [sys.executable, "-m", "pip", "install", *missing]
+    print(f"[ModManager] Не найдены/устарели зависимости: {', '.join(missing)}. Устанавливаю автоматически...")
+    pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", *missing]
     try:
         subprocess.check_call(pip_cmd)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
-            "Не удалось автоматически установить зависимости. "
+            "Не удалось автоматически установить/обновить зависимости. "
             "Проверьте подключение к интернету и права на установку пакетов, "
-            "затем выполните: pip install requests PyQt6"
+            "затем выполните: pip install --upgrade requests PyQt6"
         ) from exc
 
 
 ensure_runtime_dependencies()
 
-import requests
-from PyQt6.QtWidgets import (
+import requests  # noqa: E402
+from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTableWidget,
     QTableWidgetItem, QFileDialog, QMessageBox,
     QLabel, QProgressBar, QHeaderView, QDialog, QAbstractItemView,
     QToolButton, QMenu
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon, QAction
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer  # noqa: E402
+from PyQt6.QtGui import QColor, QIcon, QAction  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,10 +96,7 @@ logging.basicConfig(
 
 def resource_path(relative_path):
     """ Функция для поиска иконки внутри собранного EXE """
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
     return os.path.join(base_path, relative_path)
 
 
@@ -110,6 +142,17 @@ def _normalize_filename(value):
     return (value or "").strip().lower()
 
 
+def _extract_mod_version(filename: str) -> str:
+    """Вытаскивает версию мода из имени файла.
+    Примеры: YungsApi-1.21.1-NeoForge-5.1.6.jar -> 5.1.6
+             sodium-fabric-0.6.0+mc1.21.1.jar   -> 0.6.0+mc1.21.1
+    """
+    name = os.path.splitext(filename)[0]
+    parts = re.split(r'[-_]', name)
+    version_parts = [p for p in parts if re.match(r'^\d+\.\d+', p)]
+    return version_parts[-1] if version_parts else ""
+
+
 def _select_preferred_file(files, preferred_filename=""):
     if not files:
         return None
@@ -136,7 +179,7 @@ def _select_preferred_file(files, preferred_filename=""):
     return max(files, key=file_score)
 
 
-def discover_scan_targets(selected_path):
+def discover_scan_targets(selected_path: str):
     selected_path = os.path.abspath(selected_path)
     targets = []
     has_known_subdirs = False
@@ -212,7 +255,7 @@ def _install_global_exception_hook():
                 "Произошла непредвиденная ошибка.\n"
                 "Подробности записаны в app.log."
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — намеренно широкий: последний рубеж перед крашем
             pass
         original_hook(exc_type, exc_value, exc_traceback)
 
@@ -223,11 +266,17 @@ class DownloadThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
+    cancelled = pyqtSignal()
 
     def __init__(self, url, save_path):
         super().__init__()
         self.url, self.save_path = url, save_path
         self.session = requests.Session()
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+        self.session.close()
 
     def run(self):
         try:
@@ -244,13 +293,19 @@ class DownloadThread(QThread):
                 downloaded = 0
                 with open(self.save_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
+                        if self._cancel:
+                            self.cancelled.emit()
+                            return
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            if total: self.progress.emit(int(downloaded * 100 / total))
-            self.finished.emit(self.save_path)
-        except Exception as e:
-            self.error.emit(str(e))
+                            if total:
+                                self.progress.emit(int(downloaded * 100 / total))
+            if not self._cancel:
+                self.finished.emit(self.save_path)
+        except Exception as e:  # noqa: BLE001
+            if not self._cancel:
+                self.error.emit(str(e))
 
 
 class ModSearchWorker(QThread):
@@ -357,10 +412,11 @@ class ModSearchWorker(QThread):
                                 "url": primary_file.get("url", ""),
                                 "filename": primary_file.get("filename", ""),
                                 "status": "Доступен",
-                                "needs_update": False
+                                "needs_update": False,
+                                "icon_url": hit.get("icon_url") or "",
                             }
-                except (requests.RequestException, ValueError, KeyError) as e:
-                    logging.error("Ошибка получения версии: %s", e)
+                except (requests.RequestException, ValueError, KeyError) as exc:
+                    logging.error("Ошибка получения версии: %s", exc)
                 return None
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
@@ -447,7 +503,7 @@ class FolderScannerWorker(QThread):
             if r.status_code == 200:
                 recognized = r.json()
 
-                def get_project_title(project_id):
+                def get_project_info(project_id):
                     try:
                         p_res = request_with_retry(
                             self.session,
@@ -457,10 +513,14 @@ class FolderScannerWorker(QThread):
                             timeout=8
                         )
                         if p_res.status_code == 200:
-                            return p_res.json().get("title") or project_id
+                            data = p_res.json()
+                            return {
+                                "title": data.get("title") or project_id,
+                                "icon_url": data.get("icon_url") or "",
+                            }
                     except requests.RequestException as exc:
-                        logging.warning("Не удалось получить title проекта %s: %s", project_id, exc)
-                    return project_id
+                        logging.warning("Не удалось получить info проекта %s: %s", project_id, exc)
+                    return {"title": project_id, "icon_url": ""}
 
                 project_loader_hints = defaultdict(set)
                 project_version_hints = defaultdict(set)
@@ -474,76 +534,57 @@ class FolderScannerWorker(QThread):
                         project_version_hints[pid].add(game_ver)
 
                 def find_latest_release(project_id, project_type, preferred_filename="", installed_hash=None):
+                    """
+                    Запрашивает последнюю версию мода у Modrinth.
+                    Источник истины — API с явными фильтрами.
+                    Никакого угадывания: версия MC берётся только из выбора пользователя,
+                    лоадер — из выбора пользователя или primary_loader из jar-метаданных.
+                    """
                     params = {}
-                    primary_loader = loader_counter.most_common(1)[0][0] if loader_counter else None
-                    primary_version = version_counter.most_common(1)[0][0] if version_counter else None
-                    hint_loaders = project_loader_hints.get(project_id, set())
-                    hint_versions = project_version_hints.get(project_id, set())
 
-                    loaders_for_query = set()
-                    if self.loader != "авто":
-                        loaders_for_query.add(self.loader)
+                    if self.loader and self.loader.lower() != "авто":
+                        params["loaders"] = json.dumps([self.loader.lower()])
                     else:
-                        if hint_loaders:
-                            loaders_for_query.update(hint_loaders)
-                        elif project_type == "mod" and primary_loader:
-                            loaders_for_query.add(primary_loader)
-                        elif project_type == "mod":
-                            loaders_for_query.update(detected_loaders)
-                    if project_type == "mod" and adapter_present:
-                        loaders_for_query.update({"fabric", "forge"})
-                    loaders_for_query = {ldr for ldr in loaders_for_query if ldr}
-                    if loaders_for_query:
-                        params["loaders"] = json.dumps(sorted(loaders_for_query))
+                        primary_loader = loader_counter.most_common(1)[0][0] if loader_counter else None
+                        if primary_loader and project_type == "mod":
+                            loaders = {primary_loader}
+                            if adapter_present:
+                                loaders.update({"fabric", "forge"})
+                            params["loaders"] = json.dumps(sorted(loaders))
 
-                    versions_for_query = set()
-                    if self.mc_ver != "Авто":
-                        versions_for_query.add(self.mc_ver)
+                    if self.mc_ver:
+                        params["game_versions"] = json.dumps([self.mc_ver])
                     else:
-                        if hint_versions:
-                            versions_for_query.update(hint_versions)
-                        elif project_type == "mod" and primary_version:
-                            versions_for_query.add(primary_version)
-                        elif project_type == "mod":
-                            versions_for_query.update(detected_versions)
-                    if versions_for_query:
-                        params["game_versions"] = json.dumps(sorted(versions_for_query))
+                        return None
 
                     vr = request_with_retry(
-                        self.session,
-                        "GET",
+                        self.session, "GET",
                         f"{MODRINTH_API}/project/{project_id}/version",
-                        params=params if params else None,
+                        params=params,
                         headers=HEADERS,
                         timeout=10
                     )
                     vr.raise_for_status()
                     versions = vr.json()
-                    if not versions and params:
-                        vr = request_with_retry(
-                            self.session,
-                            "GET",
-                            f"{MODRINTH_API}/project/{project_id}/version",
-                            headers=HEADERS,
-                            timeout=10
-                        )
-                        vr.raise_for_status()
-                        versions = vr.json()
+
                     if not versions:
                         return None
 
-                    def pick_best_version(candidates):
-                        if not candidates:
-                            return None
-                        return max(candidates, key=lambda item: item.get("date_published") or "")
+                    def pick_newest(candidates):
+                        return max(candidates, key=lambda v: v.get("date_published") or "") if candidates else None
 
-                    release_versions = [v for v in versions if v.get("version_type") == "release"]
-                    beta_versions = [v for v in versions if v.get("version_type") == "beta"]
-                    selected = (
-                        pick_best_version(release_versions)
-                        or pick_best_version(beta_versions)
-                        or pick_best_version(versions)
-                    )
+                    releases = [v for v in versions if v.get("version_type") == "release"]
+                    betas = [v for v in versions if v.get("version_type") == "beta"]
+                    best_release = pick_newest(releases)
+                    best_beta = pick_newest(betas)
+
+                    if best_release and best_beta:
+                        selected = best_release if (best_release.get("date_published") or "") >= (best_beta.get("date_published") or "") else best_beta
+                    else:
+                        selected = best_release or best_beta or pick_newest(versions)
+
+                    if not selected:
+                        return None
 
                     version_files = selected.get("files") or []
                     if not version_files:
@@ -556,10 +597,12 @@ class FolderScannerWorker(QThread):
                     same_file = bool(installed_hash and selected_hash and installed_hash.lower() == selected_hash)
                     return {
                         "version": selected.get("version_number", "—"),
+                        "date_published": selected.get("date_published", ""),
+                        "version_id": selected.get("id", ""),
                         "url": selected_file.get("url"),
                         "filename": selected_file.get("filename"),
                         "sha1": selected_hash,
-                        "same_file": same_file
+                        "same_file": same_file,
                     }
 
                 project_ids = {
@@ -573,6 +616,7 @@ class FolderScannerWorker(QThread):
                         project_type_map[pid] = ptype
                 latest_map = {}
                 title_map = {}
+                icon_map = {}
 
                 if self.check_updates and project_ids:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
@@ -584,17 +628,22 @@ class FolderScannerWorker(QThread):
                             pid = latest_futures[future]
                             try:
                                 latest_map[pid] = future.result()
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001
                                 logging.error("Ошибка получения последней версии %s: %s", pid, e)
                                 latest_map[pid] = None
 
-                        title_futures = {ex.submit(get_project_title, pid): pid for pid in project_ids}
+                if project_ids:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as ex:
+                        title_futures = {ex.submit(get_project_info, pid): pid for pid in project_ids}
                         for future in concurrent.futures.as_completed(title_futures):
                             pid = title_futures[future]
                             try:
-                                title_map[pid] = future.result()
+                                info = future.result()
+                                title_map[pid] = info["title"]
+                                icon_map[pid] = info["icon_url"]
                             except (requests.RequestException, ValueError, KeyError):
                                 title_map[pid] = pid
+                                icon_map[pid] = ""
 
                 scanned_project_ids = set()
                 installed_project_ids = {
@@ -626,6 +675,7 @@ class FolderScannerWorker(QThread):
 
                         if self.check_updates:
                             latest_data = None
+                            api_error = False
                             if project_id:
                                 cache_key = (project_id, _normalize_filename(filename))
                                 if cache_key in entry_latest_cache:
@@ -641,26 +691,29 @@ class FolderScannerWorker(QThread):
                                     except (requests.RequestException, ValueError, KeyError) as e:
                                         logging.error("Ошибка получения версии %s (%s): %s", project_id, filename, e)
                                         latest_data = None
+                                        api_error = True
                                     entry_latest_cache[cache_key] = latest_data
-                            if not latest_data and project_id:
-                                latest_data = latest_map.get(project_id)
 
-                            if latest_data and latest_data.get("version"):
+
+                            if latest_data and latest_data.get("url"):
                                 latest_version = latest_data["version"]
                                 out_version = latest_version
                                 out_url = latest_data.get("url")
                                 out_filename = latest_data.get("filename") or filename
                                 same_file = latest_data.get("same_file", False)
-                                if latest_version != current_version:
-                                    needs_update = True
-                                    status = f"Обновление: {current_version} → {latest_version}"
-                                elif not same_file:
-                                    needs_update = True
-                                    status = "Обновление файла: версия совпадает, но сборка другая"
-                                else:
+
+                                if same_file:
                                     status = "Актуально"
-                            else:
+                                else:
+                                    needs_update = True
+                                    if latest_version != current_version:
+                                        status = f"Обновление: {current_version} → {latest_version}"
+                                    else:
+                                        status = f"Обновление файла: {current_version}"
+                            elif api_error:
                                 status = "Не удалось проверить"
+                            else:
+                                status = "Актуально"
 
                         if self.check_updates and project_id:
                             title = title_map.get(project_id, project_id)
@@ -679,6 +732,7 @@ class FolderScannerWorker(QThread):
                             "source_folder": folder,
                             "url": out_url,
                             "needs_update": needs_update,
+                            "icon_url": icon_map.get(project_id, ""),
                         }
                         self.result_ready.emit(mod_info)
                         self.mod_found.emit(mod_info)
@@ -722,41 +776,34 @@ class FolderScannerWorker(QThread):
             project_data = project_response.json()
 
             params = {}
-            if self.loader and self.loader != "авто":
-                params["loaders"] = json.dumps([self.loader])
-            if self.mc_ver and self.mc_ver != "Авто":
+            if self.loader and self.loader.lower() != "авто":
+                params["loaders"] = json.dumps([self.loader.lower()])
+            if self.mc_ver:
                 params["game_versions"] = json.dumps([self.mc_ver])
+            else:
+                return None
 
             version_response = request_with_retry(
-                self.session,
-                "GET",
+                self.session, "GET",
                 f"{MODRINTH_API}/project/{project_id}/version",
-                params=params if params else None,
+                params=params,
                 headers=HEADERS,
                 timeout=10
             )
             if version_response.status_code != 200:
                 return None
             versions = version_response.json()
-            if not versions and params:
-                version_response = request_with_retry(
-                    self.session,
-                    "GET",
-                    f"{MODRINTH_API}/project/{project_id}/version",
-                    headers=HEADERS,
-                    timeout=10
-                )
-                if version_response.status_code != 200:
-                    return None
-                versions = version_response.json()
             if not versions:
                 return None
 
-            selected_version = next((v for v in versions if v.get("version_type") == "release"), None)
+            def pick_newest_dep(candidates):
+                return max(candidates, key=lambda v: v.get("date_published") or "") if candidates else None
+
+            releases = [v for v in versions if v.get("version_type") == "release"]
+            betas = [v for v in versions if v.get("version_type") == "beta"]
+            selected_version = pick_newest_dep(releases) or pick_newest_dep(betas) or pick_newest_dep(versions)
             if not selected_version:
-                selected_version = next((v for v in versions if v.get("version_type") == "beta"), None)
-            if not selected_version:
-                selected_version = versions[0]
+                return None
 
             files = selected_version.get("files") or []
             if not files:
@@ -774,7 +821,8 @@ class FolderScannerWorker(QThread):
                 "status": "Требуется установка",
                 "is_dependency": True,
                 "is_missing_dependency": True,
-                "needs_update": False
+                "needs_update": False,
+                "icon_url": project_data.get("icon_url") or "",
             }
         except (requests.RequestException, ValueError, KeyError) as e:
             logging.error("Ошибка при получении зависимости %s: %s", project_id, e)
@@ -834,14 +882,19 @@ class FolderSelectDialog(QDialog):
 
     def browse(self):
         f = QFileDialog.getExistingDirectory(self, "Выбрать папку")
-        if f: self.folder_selected.emit(f); self.accept()
+        if f:
+            self.folder_selected.emit(f)
+            self.accept()
 
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls(): e.accept()
+        if e.mimeData().hasUrls():
+            e.accept()
 
     def dropEvent(self, e):
         path = e.mimeData().urls()[0].toLocalFile()
-        if os.path.isdir(path): self.folder_selected.emit(path); self.accept()
+        if os.path.isdir(path):
+            self.folder_selected.emit(path)
+            self.accept()
 
 
 class AppUpdateWorker(QThread):
@@ -956,7 +1009,6 @@ class MrPackDialog(QDialog):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # Заголовок
         self.title_lbl = QLabel("Парсинг файла...")
         self.title_lbl.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(self.title_lbl)
@@ -965,15 +1017,38 @@ class MrPackDialog(QDialog):
         self.info_lbl.setStyleSheet("color: #7f8c8d; font-size: 11px;")
         layout.addWidget(self.info_lbl)
 
-        # Таблица модов
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Файл", "Версия", "Статус"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        sel_row = QHBoxLayout()
+        self.select_all_btn = QPushButton("✅ Выбрать все")
+        self.select_all_btn.setFixedHeight(24)
+        self.select_all_btn.clicked.connect(self._select_all)
+        self.deselect_all_btn = QPushButton("☐ Снять все")
+        self.deselect_all_btn.setFixedHeight(24)
+        self.deselect_all_btn.clicked.connect(self._deselect_all)
+        self.selected_lbl = QLabel("")
+        self.selected_lbl.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+        sel_row.addWidget(self.select_all_btn)
+        sel_row.addWidget(self.deselect_all_btn)
+        sel_row.addStretch()
+        sel_row.addWidget(self.selected_lbl)
+        layout.addLayout(sel_row)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["", "Файл", "Версия мода", "Размер", "Статус"])
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 30)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         layout.addWidget(self.table)
 
-        # Прогресс
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+        layout.addWidget(self.status_lbl)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
@@ -988,7 +1063,7 @@ class MrPackDialog(QDialog):
         self.choose_folder_btn.clicked.connect(self._choose_folder)
         btn_row.addWidget(self.choose_folder_btn)
 
-        self.download_btn = QPushButton("⬇️ Скачать все")
+        self.download_btn = QPushButton("⬇️ Скачать выбранные")
         self.download_btn.setEnabled(False)
         self.download_btn.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold;")
         self.download_btn.clicked.connect(self._start_download)
@@ -1014,10 +1089,8 @@ class MrPackDialog(QDialog):
                     index = json.loads(fp.read().decode("utf-8"))
 
             pack_name = index.get("name", "Неизвестная сборка")
-            mc_version = ""
             loader_name = ""
 
-            # Читаем версии из dependencies
             deps = index.get("dependencies", {})
             mc_version = deps.get("minecraft", "")
             for key in ("forge", "fabric-loader", "quilt-loader", "neoforge"):
@@ -1033,7 +1106,6 @@ class MrPackDialog(QDialog):
                 info_parts.append(loader_name)
             self.info_lbl.setText("  •  ".join(info_parts) if info_parts else "")
 
-            # Парсим список файлов — только те что нужно качать с Modrinth/CDN
             raw_files = index.get("files", [])
             self.mods = []
             for entry in raw_files:
@@ -1044,8 +1116,6 @@ class MrPackDialog(QDialog):
                     continue
 
                 path = entry.get("path", "")
-                # Берём только моды (путь начинается с mods/)
-                # Шейдеры/ресурспаки тоже поддержим
                 filename = os.path.basename(path)
                 if not filename:
                     continue
@@ -1055,19 +1125,31 @@ class MrPackDialog(QDialog):
                     "path": path,
                     "downloads": entry.get("downloads", []),
                     "fileSize": entry.get("fileSize", 0),
+                    "version": _extract_mod_version(filename),
                 })
+
+            self.mods.sort(key=lambda m: m["filename"].lower())
 
             # Заполняем таблицу
             self.table.setRowCount(0)
+            self.table.blockSignals(True)
             for mod in self.mods:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
-                self.table.setItem(row, 0, QTableWidgetItem(mod["filename"]))
-                size_kb = mod["fileSize"] // 1024 if mod["fileSize"] else 0
-                self.table.setItem(row, 1, QTableWidgetItem(f"{size_kb} KB" if size_kb else "—"))
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                chk.setCheckState(Qt.CheckState.Checked)
+                self.table.setItem(row, 0, chk)
+                self.table.setItem(row, 1, QTableWidgetItem(mod["filename"]))
+                self.table.setItem(row, 2, QTableWidgetItem(mod.get("version") or "—"))
+                size_mb = mod["fileSize"] / (1024 * 1024) if mod["fileSize"] else 0
+                self.table.setItem(row, 3, QTableWidgetItem(f"{size_mb:.2f} МБ" if size_mb else "—"))
                 status_item = QTableWidgetItem("Ожидание")
                 status_item.setForeground(QColor("#7f8c8d"))
-                self.table.setItem(row, 2, status_item)
+                self.table.setItem(row, 4, status_item)
+            self.table.blockSignals(False)
+            self.table.itemChanged.connect(self._on_check_changed)
+            self._update_selected_label()
 
             total = len(self.mods)
             self.info_lbl.setText(
@@ -1077,6 +1159,39 @@ class MrPackDialog(QDialog):
         except (zipfile.BadZipFile, json.JSONDecodeError, KeyError) as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
             self.reject()
+
+    def _checked_rows(self):
+        return [r for r in range(self.table.rowCount())
+                if self.table.item(r, 0) and
+                self.table.item(r, 0).checkState() == Qt.CheckState.Checked]
+
+    def _update_selected_label(self):
+        total = self.table.rowCount()
+        checked = len(self._checked_rows())
+        self.selected_lbl.setText(f"Выбрано: {checked} из {total}")
+        self.download_btn.setText("⬇️ Скачать все" if checked == total else f"⬇️ Скачать {checked}")
+
+    def _on_check_changed(self, item):
+        if item.column() == 0:
+            self._update_selected_label()
+
+    def _select_all(self):
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.CheckState.Checked)
+        self.table.blockSignals(False)
+        self._update_selected_label()
+
+    def _deselect_all(self):
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.CheckState.Unchecked)
+        self.table.blockSignals(False)
+        self._update_selected_label()
 
     def _choose_folder(self):
         """Выбор папки назначения, с предложением перенести существующие моды"""
@@ -1096,14 +1211,15 @@ class MrPackDialog(QDialog):
         if not existing_jars:
             return
 
-        reply = QMessageBox.question(
-            self,
-            "В папке есть моды",
-            f"В выбранной папке найдено {len(existing_jars)} файлов модов.\n\n"
-            "Переместить их в другую папку перед скачиванием сборки?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        msg = QMessageBox(self)
+        msg.setWindowTitle("В папке есть моды")
+        msg.setText(f"В выбранной папке найдено {len(existing_jars)} файлов модов.\n\n"
+                    "Переместить их в другую папку перед скачиванием сборки?")
+        msg.setIcon(QMessageBox.Icon.Question)
+        btn_yes = msg.addButton("Переместить", QMessageBox.ButtonRole.YesRole)
+        msg.addButton("Оставить", QMessageBox.ButtonRole.NoRole)
+        msg.exec()
+        if msg.clickedButton() is not btn_yes:
             return
 
         move_to = QFileDialog.getExistingDirectory(self, "Куда переместить существующие моды?")
@@ -1135,33 +1251,91 @@ class MrPackDialog(QDialog):
 
         os.makedirs(self.dest_folder, exist_ok=True)
 
+        pack_filenames = {mod["filename"].lower() for mod in self.mods}
+        leftover = [
+            f for f in os.listdir(self.dest_folder)
+            if f.lower().endswith(".jar")
+            and os.path.isfile(os.path.join(self.dest_folder, f))
+            and f.lower() not in pack_filenames
+        ]
+        if leftover:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Найдены посторонние моды")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            preview = "\n".join(f"  • {f}" for f in sorted(leftover)[:8])
+            if len(leftover) > 8:
+                preview += f"\n  ... и ещё {len(leftover) - 8}"
+            msg.setText(
+                f"В папке найдено {len(leftover)} файлов, которых нет в сборке:\n\n"
+                f"{preview}\n\n"
+                "Переместить их перед скачиванием?"
+            )
+            msg.setIcon(QMessageBox.Icon.Warning)
+            btn_move = msg.addButton("Переместить", QMessageBox.ButtonRole.YesRole)
+            msg.addButton("Всё равно скачать", QMessageBox.ButtonRole.NoRole)
+            msg.exec()
+            if msg.clickedButton() is btn_move:
+                move_to = QFileDialog.getExistingDirectory(self, "Куда переместить лишние моды?")
+                if move_to:
+                    for filename in leftover:
+                        try:
+                            shutil.move(
+                                os.path.join(self.dest_folder, filename),
+                                os.path.join(move_to, filename)
+                            )
+                        except OSError as e:
+                            logging.error("Не удалось переместить %s: %s", filename, e)
+                else:
+                    # Пользователь закрыл диалог выбора папки — не начинаем скачивание
+                    return
+
+        checked_rows = self._checked_rows()
+        if not checked_rows:
+            QMessageBox.warning(self, "!", "Выберите хотя бы один мод.")
+            return
+
+        selected_mods = [self.mods[r] for r in checked_rows]
+
         self.download_btn.setEnabled(False)
         self.choose_folder_btn.setEnabled(False)
+        self.select_all_btn.setEnabled(False)
+        self.deselect_all_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(self.mods))
+        self.progress_bar.setMaximum(len(selected_mods))
         self.progress_bar.setValue(0)
+        self._spinner_idx = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.timeout.connect(self._tick_spinner)
+        self._spinner_timer.start(100)
 
-        # Сбрасываем статусы в таблице
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 2)
+        for row in checked_rows:
+            item = self.table.item(row, 4)
             if item:
                 item.setText("В очереди")
                 item.setForeground(QColor("#7f8c8d"))
 
-        self.worker = MrPackImportWorker(self.mods, self.dest_folder)
+        self.status_lbl.setText(f"⬇️ Скачивание {len(selected_mods)} модов...")
+
+        self.worker = MrPackImportWorker(selected_mods, self.dest_folder)
         self.worker.progress.connect(self._on_progress)
         self.worker.mod_done.connect(self._on_mod_done)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
+    def _tick_spinner(self):
+        chars = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+        self._spinner_idx = getattr(self, "_spinner_idx", 0) + 1
+        self.setWindowTitle(f"{chars[self._spinner_idx % len(chars)]} Импорт .mrpack сборки")
+
     def _on_progress(self, done, _total):
         self.progress_bar.setValue(done)
+        self.status_lbl.setText(f"⬇️ Скачано: {done} / {_total}")
 
     def _on_mod_done(self, filename, success):
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
+            item = self.table.item(row, 1)
             if item and item.text() == filename:
-                status_item = self.table.item(row, 2)
+                status_item = self.table.item(row, 4)
                 if status_item:
                     if success:
                         status_item.setText("✅ Скачан")
@@ -1173,9 +1347,17 @@ class MrPackDialog(QDialog):
                 break
 
     def _on_finished(self, ok, fail):
+        if hasattr(self, "_spinner_timer"):
+            self._spinner_timer.stop()
+        self.setWindowTitle("Импорт .mrpack сборки")
         self.cancel_btn.setText("Закрыть")
         self.progress_bar.setValue(self.progress_bar.maximum())
-
+        self.select_all_btn.setEnabled(True)
+        self.deselect_all_btn.setEnabled(True)
+        status = f"✅ Готово: скачано {ok}"
+        if fail:
+            status += f", ошибок {fail}"
+        self.status_lbl.setText(status)
         msg = f"Загрузка завершена!\n\nУспешно: {ok}"
         if fail:
             msg += f"\nОшибок: {fail}"
@@ -1231,18 +1413,189 @@ class ApiDataWorker(QThread):
             self.error_occurred.emit(str(e))
 
 
+ICON_CACHE_DB = "icon_cache.db"
+ICON_CACHE_MAX = 500
+ICON_CACHE_MAX_KB = 30
+
+
+class IconDiskCache:
+    """SQLite-кэш иконок модов. Ключ — project_id, значение — PNG bytes."""
+
+    def __init__(self, db_path=ICON_CACHE_DB):
+        self._db_path = db_path
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        with self._lock:
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS icons (
+                    project_id TEXT PRIMARY KEY,
+                    data       BLOB NOT NULL,
+                    last_used  INTEGER NOT NULL
+                )
+            """)
+            self._conn.commit()
+
+    def get(self, project_id: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM icons WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if row:
+                self._conn.execute(
+                    "UPDATE icons SET last_used = ? WHERE project_id = ?",
+                    (int(time.time()), project_id)
+                )
+                self._conn.commit()
+                return bytes(row[0])
+        return None
+
+    def put(self, project_id: str, png_bytes: bytes):
+        if len(png_bytes) > ICON_CACHE_MAX_KB * 1024:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO icons (project_id, data, last_used) VALUES (?, ?, ?)",
+                (project_id, png_bytes, int(time.time()))
+            )
+            self._conn.execute("""
+                DELETE FROM icons WHERE project_id NOT IN (
+                    SELECT project_id FROM icons ORDER BY last_used DESC LIMIT ?
+                )
+            """, (ICON_CACHE_MAX,))
+            self._conn.commit()
+
+    def close(self):
+        with self._lock:
+            self._conn.close()
+
+
+class IconLabel(QLabel):
+    """Маленькая иконка мода с увеличенным превью при наведении."""
+    def __init__(self, icon_url="", parent=None):
+        super().__init__(parent)
+        self.icon_url = icon_url
+        self.setFixedSize(24, 24)
+        self.setScaledContents(False)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._set_placeholder()
+
+    def _set_placeholder(self):
+        self.setText("🧩")
+        self.setStyleSheet("font-size: 14px;")
+
+    def set_icon_pixmap(self, pixmap):
+        small = pixmap.scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+        large = pixmap.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+        self.setPixmap(small)
+        self.setText("")
+        large_b64 = self._pixmap_to_base64(large)
+        self.setToolTip(f'<img src="data:image/png;base64,{large_b64}" width="128" height="128"/>')
+
+    @staticmethod
+    def _pixmap_to_base64(pixmap):
+        from PyQt6.QtCore import QBuffer, QIODevice
+        import base64
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        pixmap.save(buf, "PNG")
+        return base64.b64encode(buf.data().data()).decode()
+
+
+class IconFetchWorker(QThread):
+    """Фоновая загрузка иконки мода по URL с поддержкой дискового кэша."""
+    icon_ready = pyqtSignal(str, object)  # (icon_url, QPixmap)
+
+    def __init__(self, icon_url, project_id="", disk_cache=None):
+        super().__init__()
+        self.icon_url = icon_url
+        self.project_id = project_id
+        self.disk_cache = disk_cache
+        self.session = requests.Session()
+
+    def run(self):
+        from PyQt6.QtGui import QPixmap
+        from PyQt6.QtCore import QByteArray
+
+        # Сначала дисковый кэш
+        if self.disk_cache and self.project_id:
+            cached = self.disk_cache.get(self.project_id)
+            if cached:
+                pixmap = QPixmap()
+                pixmap.loadFromData(QByteArray(cached))
+                if not pixmap.isNull():
+                    self.icon_ready.emit(self.icon_url, pixmap)
+                    return
+
+        # Качаем из сети
+        try:
+            r = request_with_retry(self.session, "GET", self.icon_url,
+                                   timeout=(5, 10), headers=HEADERS)
+            if r.status_code == 200:
+                pixmap = QPixmap()
+                pixmap.loadFromData(QByteArray(r.content))
+                if not pixmap.isNull():
+                    if self.disk_cache and self.project_id:
+                        self.disk_cache.put(self.project_id, r.content)
+                    self.icon_ready.emit(self.icon_url, pixmap)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _ErrorSignalHandler(logging.Handler):
+    """Logging handler который показывает ⚠️ в UI при любой ошибке."""
+    def __init__(self, callback):
+        super().__init__()
+        self._callback = callback
+
+    def emit(self, record):
+        try:
+            self._callback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class ModManagerApp(QWidget):
     def ask_for_update(self, remote_version):
-        reply = QMessageBox.question(
-            self, "Обновление доступно",
-            f"Доступна новая версия v{remote_version}!\n"
-            f"У вас установлена v{VERSION}.\n\n"
-            "Хотите перейти на страницу скачивания?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            import webbrowser
+        if self.isMinimized() or not self.isVisible():
+            self._pending_update_version = remote_version
+            return
+        self._show_update_dialog(remote_version)
+
+    def _show_update_dialog(self, remote_version):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Обновление доступно")
+        msg.setText(f"Доступна новая версия v{remote_version}!\n"
+                    f"У вас установлена v{VERSION}.\n\n"
+                    "Хотите перейти на страницу скачивания?")
+        msg.setIcon(QMessageBox.Icon.Information)
+        btn_yes = msg.addButton("Перейти", QMessageBox.ButtonRole.YesRole)
+        msg.addButton("Позже", QMessageBox.ButtonRole.NoRole)
+        msg.exec()
+        if msg.clickedButton() is btn_yes:
             webbrowser.open("https://github.com/1FaY1/ModManager/releases")
+
+    def changeEvent(self, event):
+        """Показываем отложенный диалог обновления когда окно разворачивается."""
+        super().changeEvent(event)
+        if (event.type() == event.Type.WindowStateChange
+                and not self.isMinimized()
+                and hasattr(self, "_pending_update_version")
+                and self._pending_update_version):
+            version = self._pending_update_version
+            self._pending_update_version = ""
+            self._show_update_dialog(version)
+
+    def closeEvent(self, event):
+        try:
+            self._icon_disk_cache.close()
+        except Exception:  # noqa: BLE001
+            pass
+        event.accept()
 
     def save_config(self):
         """Централизованное сохранение настроек в JSON файл"""
@@ -1250,7 +1603,8 @@ class ModManagerApp(QWidget):
             with open(CONFIG_FILE, 'w') as conf:
                 json.dump({
                     "download_folder": self.download_folder,
-                    "backup_folder": self.backup_folder
+                    "backup_folder": self.backup_folder,
+                    "last_scan_path": self.instance_root or self.mods_folder,
                 }, conf)
         except OSError as e:
             logging.error("Ошибка сохранения конфига: %s", e)
@@ -1280,18 +1634,29 @@ class ModManagerApp(QWidget):
         self.max_parallel_downloads = 4
         self.batch_action_queue = []
         self.active_batch_downloads = 0
+        self._pumping_batch = False
+        self._scan_result_count = 0
+        self._pending_update_version = ""
+        self._batch_errors = []
+        self._icon_cache = {}
+        self._icon_workers = []
+        self._icon_disk_cache = IconDiskCache(ICON_CACHE_DB)
 
         self._init_ui()
         self.load_settings()
         self.status_lbl.setText("Загрузка данных API...")
         self.api_worker = ApiDataWorker()
         self.api_worker.data_loaded.connect(self._on_api_data_ready)
-        self.api_worker.error_occurred.connect(lambda err: logging.error(f"Ошибка API: {err}"))
+        self.api_worker.error_occurred.connect(lambda err: logging.error("Ошибка API: %s", err))
         self.api_worker.start()
 
         self.update_worker = AppUpdateWorker()
         self.update_worker.update_found.connect(self.ask_for_update)
         self.update_worker.start()
+
+        _err_handler = _ErrorSignalHandler(self._show_error_indicator)
+        _err_handler.setLevel(logging.ERROR)
+        logging.getLogger().addHandler(_err_handler)
 
     def _on_api_data_ready(self, versions, loaders_by_type):
         self.available_versions = list(versions)
@@ -1310,10 +1675,11 @@ class ModManagerApp(QWidget):
         self.version_box.clear()
         self.loader_box.clear()
         self.loader_label.setText(PROJECT_TYPE_LOADER_LABELS.get(project_type, "Загрузчик:"))
-        self.version_box.addItem("Авто")
         self.loader_box.addItem("Авто")
-        self.version_box.addItems(self.available_versions)
         self.loader_box.addItems(loaders)
+        if self.available_versions:
+            self.version_box.addItems(self.available_versions)
+            self.version_box.setCurrentIndex(0)
         self.status_lbl.setText("Готово к работе")
 
     def load_settings(self):
@@ -1325,8 +1691,11 @@ class ModManagerApp(QWidget):
                     self.backup_folder = config.get("backup_folder", "")
                     if self.download_folder:
                         self.status_lbl.setText(f"Загрузка в: {self.download_folder}")
+                    last_path = config.get("last_scan_path", "")
+                    if last_path and os.path.isdir(last_path):
+                        QTimer.singleShot(300, lambda: self._set_scan_path(last_path))
             except (OSError, ValueError, json.JSONDecodeError) as e:
-                logging.error(f"Не удалось загрузить настройки: {e}")
+                logging.error("Не удалось загрузить настройки: %s", e)
 
     def _init_ui(self):
         self.setStyleSheet("""
@@ -1375,18 +1744,46 @@ class ModManagerApp(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.verticalHeader().setDefaultSectionSize(30)
 
         layout.addWidget(self.table)
 
         bottom = QHBoxLayout()
-        self.menu_btn = QPushButton("⋮")
-        self.menu_btn.setObjectName("MenuBtn")
-        self.menu_btn.clicked.connect(self.select_download_folder)
+
+        self.settings_btn = QToolButton()
+        self.settings_btn.setText("⚙️")
+        self.settings_btn.setObjectName("MenuBtn")
+        self.settings_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.settings_btn.setStyleSheet("QToolButton { border: none; background: transparent; font-size: 18px; }"
+                                        "QToolButton::menu-indicator { image: none; }")
+        settings_menu = QMenu(self)
+
+        action_dl_folder = QAction("📂 Папка загрузки новых модов...", self)
+        action_dl_folder.triggered.connect(self.select_download_folder)
+        settings_menu.addAction(action_dl_folder)
+
+        action_backup_folder = QAction("💾 Папка резервных копий...", self)
+        action_backup_folder.triggered.connect(self.select_custom_backup_folder)
+        settings_menu.addAction(action_backup_folder)
+
+        settings_menu.addSeparator()
+
+        action_open_log = QAction("📋 Открыть app.log", self)
+        action_open_log.triggered.connect(lambda: os.startfile("app.log") if os.path.exists("app.log") else None)
+        settings_menu.addAction(action_open_log)
+
+        self.settings_btn.setMenu(settings_menu)
+        bottom.addWidget(self.settings_btn)
+
+        self.error_indicator = QLabel("")
+        self.error_indicator.setStyleSheet("color: #e74c3c; font-size: 13px;")
+        self.error_indicator.setToolTip("Есть ошибки — см. app.log")
+        self.error_indicator.setVisible(False)
+        bottom.addWidget(self.error_indicator)
 
         self.status_lbl = QLabel("Готов к работе")
         self.status_lbl.setStyleSheet("color: #7f8c8d; font-size: 11px;")
 
-        bottom.addWidget(self.menu_btn)
         bottom.addWidget(self.status_lbl)
         bottom.addStretch()
 
@@ -1410,22 +1807,19 @@ class ModManagerApp(QWidget):
         self.backup_before_update_action = QAction("Резервное копирование перед обновлением", self)
         self.backup_before_update_action.setCheckable(True)
         self.backup_before_update_action.setChecked(False)
-        self.backup_before_update_action.setStatusTip("Сохраняет старые версии файлов в папку 'backups' перед заменой")
         self.backup_before_update_action.setToolTip(
             "Безопасное обновление: копия старого мода сохранится автоматически")
         update_menu.addAction(self.backup_before_update_action)
-
-        update_menu.addSeparator()
-
-        self.select_backup_dir_action = QAction("⋮ Выбрать папку для бэкапов...", self)
-        self.select_backup_dir_action.triggered.connect(self.select_custom_backup_folder)
-        update_menu.addAction(self.select_backup_dir_action)
 
         self.update_all_btn.setMenu(update_menu)
 
         bottom.addWidget(self.scan_btn)
         bottom.addWidget(self.update_all_btn)
         layout.addLayout(bottom)
+
+    def _show_error_indicator(self):
+        self.error_indicator.setText("⚠️")
+        self.error_indicator.setVisible(True)
 
     def open_source_link(self, row, column):
         if column != 1:
@@ -1436,7 +1830,6 @@ class ModManagerApp(QWidget):
         source_url = item.data(Qt.ItemDataRole.UserRole)
         if not source_url:
             return
-        import webbrowser
         webbrowser.open(source_url)
 
     def _handle_cell_entered(self, row, col):
@@ -1459,11 +1852,28 @@ class ModManagerApp(QWidget):
             self.status_lbl.setText(f"⌛ {msg}...")
             self.scan_btn.setEnabled(False)
             self.search_btn_ui.setEnabled(False)
+            self._spinner_idx = 0
+            self._spinner_msg = msg
+            if not hasattr(self, "_spinner_timer"):
+                self._spinner_timer = QTimer(self)
+                self._spinner_timer.timeout.connect(self._tick_main_spinner)
+            self._spinner_timer.start(100)
         else:
+            if hasattr(self, "_spinner_timer"):
+                self._spinner_timer.stop()
+            self.setWindowTitle(f"Mod Manager Pro v{VERSION}")
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self.status_lbl.setText("✅ Готово")
-            if self.mods_folder: self.scan_btn.setEnabled(True)
+            if self.mods_folder:
+                self.scan_btn.setEnabled(True)
             self.search_btn_ui.setEnabled(True)
+
+    def _tick_main_spinner(self):
+        chars = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+        self._spinner_idx = getattr(self, "_spinner_idx", 0) + 1
+        ch = chars[self._spinner_idx % len(chars)]
+        msg = getattr(self, "_spinner_msg", "")
+        self.setWindowTitle(f"{ch} {msg} — Mod Manager Pro v{VERSION}")
 
     def select_scan_folder(self):
         d = FolderSelectDialog("Выберите папку с вашими модами", self)
@@ -1477,20 +1887,29 @@ class ModManagerApp(QWidget):
 
         self.active_project_type = self._resolve_active_project_type()
         self._refresh_loader_options()
-        self.auto_loader_hint, self.auto_version_hint = self._detect_instance_hints(self.scan_targets)
+        self.auto_loader_hint = ""
+        self.auto_version_hint = ""
 
         self.mods_folder = self.scan_targets[0]["folder"]
         self.scan_btn.setEnabled(True)
         self.table.setRowCount(0)
         self.update_all_btn.hide()
+        self.updated_mods = []
+        self._scan_result_count = 0
         targets_summary = ", ".join(t["title"] for t in self.scan_targets)
         self.status_lbl.setText(f"Выбрано: {targets_summary}")
-        self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(), self.version_box.currentText(),
-                                           check_updates=False)
+        self.save_config()
+        self.set_loading(True, "Сканирование модов")
+        self.scanner = FolderScannerWorker(
+            self.scan_targets, self.loader_box.currentText(),
+            self.version_box.currentText(), check_updates=False
+        )
         self.scanner.result_ready.connect(self._handle_scanner_result)
+        self.scanner.finished.connect(self._handle_scanner_finished)
         self.scanner.start()
 
-    def _detect_instance_hints(self, targets):
+    @staticmethod
+    def _detect_instance_hints(targets):
         loader_counter = Counter()
         version_counter = Counter()
         for target in targets:
@@ -1513,8 +1932,15 @@ class ModManagerApp(QWidget):
     def scan_folder(self):
         if not self.scan_targets:
             return
+        if not self.version_box.currentText():
+            QMessageBox.warning(self, "Выберите версию",
+                                "Пожалуйста, выберите версию Minecraft перед проверкой обновлений.\n\n"
+                                "Без версии невозможно точно определить актуальность модов.")
+            return
         self.table.setRowCount(0)
         self.update_all_btn.hide()
+        self.updated_mods = []
+        self._scan_result_count = 0
         self.set_loading(True, "Проверка обновлений")
         self.scanner = FolderScannerWorker(self.scan_targets, self.loader_box.currentText(),
                                            self.version_box.currentText(), check_updates=True)
@@ -1525,12 +1951,43 @@ class ModManagerApp(QWidget):
     def _handle_scanner_result(self, res):
         if self.sender() is not self.scanner:
             return
-        self.add_mod_to_table(res)
+        try:
+            self.add_mod_to_table(res)
+            self._scan_result_count += 1
+            if self._scan_result_count % 10 == 0:
+                self.status_lbl.setText(f"⌛ Сканирование... найдено {self._scan_result_count}")
+        except Exception:
+            logging.exception("Ошибка в _handle_scanner_result")
 
     def _handle_scanner_finished(self):
         if self.sender() is not self.scanner:
             return
-        self.set_loading(False)
+        try:
+            self._scan_result_count = 0
+            self.set_loading(False)
+            self._update_mod_counter()
+        except Exception:
+            logging.exception("Ошибка в _handle_scanner_finished")
+
+    def _update_mod_counter(self):
+        total = self.table.rowCount()
+        needs_update = 0
+        errors = 0
+        for row in range(total):
+            item = self.table.item(row, 3)
+            if not item:
+                continue
+            text = item.text() or ""
+            if "Обновление" in text:
+                needs_update += 1
+            elif "Не удалось" in text:
+                errors += 1
+        parts = [f"Модов: {total}"]
+        if needs_update:
+            parts.append(f"🔄 Обновлений: {needs_update}")
+        if errors:
+            parts.append(f"⚠️ Не проверено: {errors}")
+        self.status_lbl.setText("  •  ".join(parts))
 
     def select_download_folder(self):
         """Выбор папки, куда качать новые моды (по нажатию на ⋮ внизу)"""
@@ -1543,25 +2000,27 @@ class ModManagerApp(QWidget):
 
     def start_search(self):
         q = self.search_input.text().strip()
-        if not q: return
+        if not q:
+            return
         selected_loader = self.loader_box.currentText()
         selected_version = self.version_box.currentText()
-        worker_loader = selected_loader
-        worker_version = selected_version
 
-        if selected_loader == "Авто" and self.auto_loader_hint:
-            worker_loader = self.auto_loader_hint.capitalize()
-        if selected_version == "Авто" and self.auto_version_hint:
-            worker_version = self.auto_version_hint
+        # Лоадер: Авто допустим (поиск без фильтра по лоадеру)
+        # Версия: без выбора поиск будет ненадёжным — предупреждаем
+        if not selected_version:
+            QMessageBox.warning(self, "Выберите версию",
+                                "Выберите версию Minecraft для точного поиска модов.")
+            return
 
         self.table.setRowCount(0)
         self.update_all_btn.hide()
         self.set_loading(True, "Поиск модов")
-        self.worker = ModSearchWorker(q, worker_loader, worker_version, project_type=self.active_project_type)
+        self.worker = ModSearchWorker(q, selected_loader, selected_version, project_type=self.active_project_type)
 
         def on_done(res, ok):
             if ok:
-                for r in res: self.add_mod_to_table(r)
+                for r in res:
+                    self.add_mod_to_table(r)
             self.set_loading(False)
 
         self.worker.results_ready.connect(on_done)
@@ -1573,9 +2032,67 @@ class ModManagerApp(QWidget):
 
         is_dep = res.get("is_dependency", False)
         title_text = f"  ↳ [Зависимость] {res['title']}" if is_dep else res["title"]
+        icon_url = res.get("icon_url", "")
+
+        cell_widget = QWidget()
+        cell_layout = QHBoxLayout(cell_widget)
+        cell_layout.setContentsMargins(4, 0, 4, 0)
+        cell_layout.setSpacing(6)
+
+        icon_lbl = IconLabel(icon_url)
+        cell_layout.addWidget(icon_lbl)
+
+        title_lbl = QLabel(title_text)
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        if is_dep:
+            title_lbl.setStyleSheet("color: #bdc3c7;")
+        cell_layout.addWidget(title_lbl, stretch=1)
+
+        # Храним данные для download() в свойстве виджета
+        real_filename = res.get("display_name") or res.get("filename") or res["title"]
+        cell_widget.setProperty("filename", real_filename)
+        cell_widget.setProperty("source_folder", res.get("source_folder"))
+        cell_widget.setProperty("role", "dependency" if is_dep else "mod")
+        self.table.setCellWidget(row, 0, cell_widget)
+
+        # Невидимый QTableWidgetItem в col 0 для хранения данных (нужен для _get_action_button)
+        # Текст пустой — реальное название показывает cell_widget (иконка + QLabel)
+        hidden_item = QTableWidgetItem("")
+        hidden_item.setData(Qt.ItemDataRole.UserRole, {
+            "filename": real_filename,
+            "source_folder": res.get("source_folder")
+        })
+        hidden_item.setData(Qt.ItemDataRole.UserRole + 1, "dependency" if is_dep else "mod")
+        # Полное название храним отдельно — на случай если понадобится поиск/сортировка
+        hidden_item.setData(Qt.ItemDataRole.UserRole + 2, title_text)
+        self.table.setItem(row, 0, hidden_item)
+
+        if icon_url:
+            project_id_for_icon = res.get("project_id", "")
+            if icon_url in self._icon_cache:
+                icon_lbl.set_icon_pixmap(self._icon_cache[icon_url])
+            else:
+                worker = IconFetchWorker(
+                    icon_url,
+                    project_id=project_id_for_icon,
+                    disk_cache=self._icon_disk_cache
+                )
+
+                def _on_icon(url, pixmap, lbl=icon_lbl):
+                    self._icon_cache[url] = pixmap
+                    try:
+                        lbl.set_icon_pixmap(pixmap)
+                    except RuntimeError:
+                        pass  # lbl удалён — нормально
+                    except Exception:
+                        logging.exception("Ошибка установки иконки для %s", url)
+
+                worker.icon_ready.connect(_on_icon)
+                worker.finished.connect(lambda w=worker: self._icon_workers.remove(w) if w in self._icon_workers else None)
+                self._icon_workers.append(worker)
+                worker.start()
 
         items = [
-            (0, title_text),
             (1, "🔗 Modrinth" if res.get("source_url") else (res.get("author") or res.get("scan_type", "—"))),
             (2, res.get("version", "—")),
             (3, res.get("status", "Неизвестно"))
@@ -1584,21 +2101,7 @@ class ModManagerApp(QWidget):
         for col, text in items:
             item = QTableWidgetItem(text)
             item.setToolTip(text)
-
-            if col == 0:
-                item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-                item.setData(Qt.ItemDataRole.UserRole + 1, "dependency" if is_dep else "mod")
-                if is_dep:
-                    item.setForeground(QColor("#bdc3c7"))
-            else:
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            if col == 0:
-                real_filename = res.get("display_name") or res.get("filename") or res["title"]
-                item.setData(Qt.ItemDataRole.UserRole, {
-                    "filename": real_filename,
-                    "source_folder": res.get("source_folder")
-                })
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             if col == 3:
                 if res.get("needs_update"):
@@ -1648,25 +2151,13 @@ class ModManagerApp(QWidget):
         self.table.scrollToBottom()
 
     def update_all_mods(self):
-        removed_duplicates = self._cleanup_duplicate_versions_before_batch()
-        if removed_duplicates > 0:
-            self.status_lbl.setText(
-                f"🧹 Удалено старых дубликатов модов: {removed_duplicates}"
-            )
-            QApplication.processEvents()
+        self._batch_errors = []
 
         main_update_rows = self._collect_update_rows(include_dependencies=False)
         dependency_rows = self._collect_update_rows(include_dependencies=True, dependency_only=True)
 
         if not main_update_rows and not dependency_rows:
-            if removed_duplicates > 0:
-                QMessageBox.information(
-                    self,
-                    "Очистка завершена",
-                    f"Удалено старых дубликатов: {removed_duplicates}.\nНовых обновлений не найдено."
-                )
-            else:
-                QMessageBox.information(self, "Обновление", "Нет модов, требующих обновления.")
+            QMessageBox.information(self, "Обновление", "Нет модов, требующих обновления.")
             return
 
         update_rows = list(main_update_rows)
@@ -1676,7 +2167,7 @@ class ModManagerApp(QWidget):
             msg.setWindowTitle("Обязательные зависимости")
             msg.setText(f"Обнаружено {len(dependency_rows)} обязательных зависимостей для установки.")
             msg.setInformativeText("Скачать их вместе с остальными обновлениями?")
-            btn_yes = msg.addButton("Скачать всё", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Скачать всё", QMessageBox.ButtonRole.AcceptRole)
             btn_no = msg.addButton("Только моды", QMessageBox.ButtonRole.RejectRole)
             btn_cancel = msg.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
 
@@ -1691,12 +2182,6 @@ class ModManagerApp(QWidget):
 
         if not update_rows:
             return
-
-        if removed_duplicates > 0:
-            self.status_lbl.setText(
-                f"🧹 Удалено старых дубликатов модов: {removed_duplicates}. Запускаю обновление..."
-            )
-            QApplication.processEvents()
 
         self.batch_total_updates = len(update_rows)
         self.pending_batch_updates = len(update_rows)
@@ -1734,9 +2219,12 @@ class ModManagerApp(QWidget):
         self.active_batch_downloads = 0
         self._pump_batch_downloads()
 
-    def _mark_batch_download_done(self, ok):
+    def _mark_batch_download_done(self, ok, err_msg=""):
         if self.pending_batch_updates <= 0:
             return
+
+        if not ok and err_msg:
+            self._batch_errors.append(err_msg)
 
         self.pending_batch_updates -= 1
         completed = self.batch_total_updates - self.pending_batch_updates
@@ -1752,8 +2240,21 @@ class ModManagerApp(QWidget):
             self.active_batch_downloads = 0
             self.update_all_btn.setEnabled(True)
             self.set_loading(False)
+            # Финальная очистка дублей — в фоне чтобы не вешать UI
+            def _bg_final_cleanup():
+                removed = self._cleanup_duplicate_versions_before_batch()
+                if removed:
+                    logging.info("Post-batch cleanup: удалено %s дублей", removed)
+            threading.Thread(target=_bg_final_cleanup, daemon=True).start()
+            if self._batch_errors:
+                errors_text = "\n".join(f"• {e}" for e in self._batch_errors[:10])
+                if len(self._batch_errors) > 10:
+                    errors_text += f"\n... и ещё {len(self._batch_errors) - 10}"
+                QMessageBox.warning(self, "Ошибки при обновлении",
+                                    f"Не удалось скачать {len(self._batch_errors)} мод(ов):\n\n{errors_text}")
+                self._batch_errors = []
 
-    def _get_action_button(self, row):
+    def _get_action_button(self, row) -> Optional[QPushButton]:
         container = self.table.cellWidget(row, 5)
         if not container:
             return None
@@ -1787,14 +2288,20 @@ class ModManagerApp(QWidget):
         return updates
 
     def _pump_batch_downloads(self):
-        while self.batch_action_queue and self.active_batch_downloads < self.max_parallel_downloads:
-            _, btn, _, _ = self.batch_action_queue.pop(0)
-            if not btn:
-                continue
-            btn.setProperty("batch_run", True)
-            self.active_batch_downloads += 1
-            btn.click()
-            QApplication.processEvents()
+        if self._pumping_batch:
+            return
+        self._pumping_batch = True
+        try:
+            while self.batch_action_queue and self.active_batch_downloads < self.max_parallel_downloads:
+                _, btn, _, _ = self.batch_action_queue.pop(0)
+                if not btn:
+                    continue
+                btn.setProperty("batch_run", True)
+                self.active_batch_downloads += 1
+                btn.click()
+                QApplication.processEvents()
+        finally:
+            self._pumping_batch = False
 
     @staticmethod
     def _parse_iso_datetime(raw_value):
@@ -1809,11 +2316,14 @@ class ModManagerApp(QWidget):
     def _derive_mod_family_key(filename):
         name_without_ext = os.path.splitext(filename)[0].lower()
         match = re.search(r"[-_.]v?\d", name_without_ext)
-        if match:
-            return name_without_ext[:match.start()].strip("-_. ")
+        if match and match.start() > 0:
+            key = name_without_ext[:match.start()].strip("-_. ")
+            if key:
+                return key
         return name_without_ext
 
-    def _collect_hash_index(self, folder):
+    @staticmethod
+    def _collect_hash_index(folder):
         hash_to_files = defaultdict(list)
         jar_files = [f for f in os.listdir(folder) if f.lower().endswith(".jar")]
         for mod_file in jar_files:
@@ -1840,7 +2350,8 @@ class ModManagerApp(QWidget):
             return {}
         return response.json()
 
-    def _remove_file_list(self, folder, filenames, keep_name):
+    @staticmethod
+    def _remove_file_list(folder, filenames, keep_name):
         removed = 0
         for name in filenames:
             if name == keep_name:
@@ -1871,6 +2382,7 @@ class ModManagerApp(QWidget):
             return 0
 
         grouped = defaultdict(list)
+        removed_count = 0
         for file_hash, data in recognized.items():
             project_id = data.get("project_id")
             if not project_id:
@@ -1882,7 +2394,6 @@ class ModManagerApp(QWidget):
                 if os.path.exists(path):
                     grouped[project_id].append((file_name, published, version_number, os.path.getmtime(path)))
 
-        removed_count = 0
         for versions in grouped.values():
             if len(versions) < 2:
                 continue
@@ -1916,7 +2427,6 @@ class ModManagerApp(QWidget):
         if len(jar_files) < 2 or not hash_to_files:
             return 0
 
-        removed_count = 0
         recognized_entries = []
         try:
             recognized = self._fetch_recognized_files(hash_to_files.keys())
@@ -1973,7 +2483,8 @@ class ModManagerApp(QWidget):
         project_id = btn.property("project_id")
         source_folder = btn.property("source_folder")
         is_batch_run = bool(btn.property("batch_run"))
-        is_update = btn.text() == "Обновить"
+        btn_text = btn.text()
+        is_update = btn_text == "Обновить"
         save_dir = (source_folder or self.mods_folder) if (is_update or not self.download_folder) else self.download_folder
 
         if not save_dir:
@@ -2009,10 +2520,10 @@ class ModManagerApp(QWidget):
                         for file_hash, data in recognized.items():
                             if data.get("project_id") == project_id:
                                 old_files = hash_to_file.get(file_hash, [])
-                                for old_file in old_files:
-                                    if old_file == filename:
+                                for existing_name in old_files:
+                                    if existing_name == filename:
                                         continue
-                                    files_to_delete_after_download.append(old_file)
+                                    files_to_delete_after_download.append(existing_name)
                         recognized_processed = True
 
                 if not recognized_processed:
@@ -2041,18 +2552,31 @@ class ModManagerApp(QWidget):
                                 if existing_file in valid_filenames:
                                     files_to_delete_after_download.append(existing_file)
                                 QApplication.processEvents()
-            except (requests.RequestException, OSError) as e:
-                logging.error("Ошибка точной очистки: %s", e)
+            except (requests.RequestException, OSError) as exc:
+                logging.error("Ошибка точной очистки: %s", exc)
 
         files_to_delete_after_download = sorted(set(files_to_delete_after_download))
 
         dest = os.path.join(save_dir, filename)
         container = self.table.cellWidget(row, 4)
-        pbar = container.findChild(QProgressBar)
+        pbar = cast(Optional[QProgressBar], container.findChild(QProgressBar)) if container else None
+        if pbar is None:
+            logging.warning("Не найден progress bar для строки %s", row)
+            btn.setEnabled(True)
+            return
         btn.setEnabled(False)
+
+        cancel_btn = QPushButton("✕")
+        cancel_btn.setFixedSize(20, 20)
+        cancel_btn.setStyleSheet("QPushButton { color: #e74c3c; font-weight: bold; padding: 0; }")
+        cancel_btn.setToolTip("Отменить скачивание")
+        pbar_layout = container.layout()
+        if pbar_layout:
+            pbar_layout.addWidget(cancel_btn)
 
         downloader = DownloadThread(url, dest)
         downloader.progress.connect(pbar.setValue)
+        cancel_btn.clicked.connect(downloader.cancel)
 
         def cleanup():
             if downloader in self.active_downloads:
@@ -2060,28 +2584,36 @@ class ModManagerApp(QWidget):
                 logging.info("Поток для %s очищен из памяти.", filename)
 
         def on_done(path):
+            cancel_btn.setVisible(False)
             btn.setText("Ок")
             btn.setProperty("batch_run", False)
-            self.table.item(row, 0).setText(filename)
-            self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, {
-                "filename": filename,
-                "source_folder": source_folder
-            })
+            # Обновляем только UserRole данные в hidden item — НЕ трогаем текст,
+            # чтобы не сломать иконку (она живёт в cellWidget col 0)
+            row_item = self.table.item(row, 0)
+            if row_item is not None:
+                row_item.setData(Qt.ItemDataRole.UserRole, {
+                    "filename": filename,
+                    "source_folder": source_folder
+                })
+                row_item.setData(Qt.ItemDataRole.UserRole + 2, filename)
             self.status_lbl.setText(f"Скачано: {filename}")
 
             if os.path.exists(path):
-                for old_file in files_to_delete_after_download:
-                    old_path = os.path.join(save_dir, old_file)
+                for obsolete_file in files_to_delete_after_download:
+                    old_path = os.path.join(save_dir, obsolete_file)
                     if os.path.exists(old_path):
                         try:
                             os.remove(old_path)
-                            logging.info("Удалена старая версия мода после загрузки: %s", old_file)
-                        except OSError as e:
-                            logging.error("Не удалось удалить %s: %s", old_file, e)
+                            logging.info("Удалена старая версия мода после загрузки: %s", obsolete_file)
+                        except OSError as exc:
+                            logging.error("Не удалось удалить %s: %s", obsolete_file, exc)
+                # Пост-очистка дублей делается в отдельном потоке, чтобы не блокировать UI
                 if project_id:
-                    removed_post = self._cleanup_project_duplicates_in_folder(save_dir, project_id, filename)
-                    if removed_post:
-                        logging.info("Post-cleanup удалил %s дублей для project_id=%s", removed_post, project_id)
+                    def _deferred_cleanup(sid=save_dir, pid=project_id, fn=filename):
+                        removed = self._cleanup_project_duplicates_in_folder(sid, pid, fn)
+                        if removed:
+                            logging.info("Post-cleanup удалил %s дублей для project_id=%s", removed, pid)
+                    threading.Thread(target=_deferred_cleanup, daemon=True).start()
 
             if os.path.exists(path) and filename not in self.updated_mods:
                 self.updated_mods.append(filename)
@@ -2093,17 +2625,38 @@ class ModManagerApp(QWidget):
             self._pump_batch_downloads()
 
         def on_error(err_msg):
-            QMessageBox.critical(self, "Ошибка", err_msg)
+            cancel_btn.setVisible(False)
             btn.setEnabled(True)
             btn.setProperty("batch_run", False)
             cleanup()
-            self._mark_batch_download_done(False)
+            if is_batch_run:
+                self._mark_batch_download_done(False, f"{filename}: {err_msg}")
+            else:
+                QMessageBox.critical(self, "Ошибка скачивания", err_msg)
+                self._mark_batch_download_done(False)
+            if is_batch_run and self.active_batch_downloads > 0:
+                self.active_batch_downloads -= 1
+            self._pump_batch_downloads()
+
+        def on_cancelled():
+            cancel_btn.setVisible(False)
+            btn.setEnabled(True)
+            btn.setProperty("batch_run", False)
+            pbar.setValue(0)
+            if os.path.exists(dest):
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+            self.status_lbl.setText(f"⛔ Отменено: {filename}")
+            cleanup()
             if is_batch_run and self.active_batch_downloads > 0:
                 self.active_batch_downloads -= 1
             self._pump_batch_downloads()
 
         downloader.finished.connect(on_done)
         downloader.error.connect(on_error)
+        downloader.cancelled.connect(on_cancelled)
 
         self.active_downloads.append(downloader)
         downloader.start()
