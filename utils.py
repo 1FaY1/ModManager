@@ -22,10 +22,6 @@ def get_file_hash(path):
         return None
 
 
-# Единый паттерн для MC-версий обоих форматов.
-# Патч всегда опциональный — охватывает "1.20", "1.20.1", "26.1", "26.1.2".
-# Новый формат: major 20-29, minor 1-12, patch 0-99 (напр. 26.1, 26.1.2)
-# Старый формат: 1.x.y где x in 14-29 (напр. 1.21, 1.21.1)
 _MC_RE = re.compile(
     r"\b((?:2[0-9]\.\d{1,2}|1\.(?:1[4-9]|2\d))(?:\.\d{1,2})?)\b"
 )
@@ -46,9 +42,6 @@ def _extract_versions(value):
     if isinstance(value, str):
         result = set()
         for m in _MC_RE.finditer(value):
-            # Проверяем что перед совпадением нет признаков верхней границы диапазона.
-            # Верхняя граница: "[1.20, 1.21)" — перед 1.21 стоит "," (с любым кол-вом пробелов)
-            # или "<1.21" — перед 1.21 стоит "<"
             start = m.start()
             trimmed_prefix = value[:start].rstrip()
             if trimmed_prefix.endswith("<") or trimmed_prefix.endswith(","):
